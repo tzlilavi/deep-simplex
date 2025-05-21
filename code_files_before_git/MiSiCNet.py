@@ -40,10 +40,10 @@ class MiSiCNet2(nn.Module):
                                        nn.BatchNorm1d(init_channels//16, eps=eps, momentum=0.1, affine=True, track_running_stats=True),
                                        # nn.LeakyReLU(0.1, inplace=True),
                                        nn.Dropout(dropout))
-        self.fc1 = nn.Sequential(nn.Linear(in_features=init_channels//16, out_features=out_dim + CFG.add_noise),
+        self.fc1 = nn.Sequential(nn.Linear(in_features=init_channels//16, out_features=out_dim + CFG.noise),
                                  nn.GELU(), nn.Dropout(dropout),
-                                 nn.LayerNorm(out_dim + CFG.add_noise)) ## [L,J + 1]
-        self.decoder = nn.Linear(in_features=out_dim + CFG.add_noise, out_features=L, bias=False)
+                                 nn.LayerNorm(out_dim + CFG.noise)) ## [L,J + 1]
+        self.decoder = nn.Linear(in_features=out_dim + CFG.noise, out_features=L, bias=False)
         self.leakyReLU = nn.LeakyReLU(0.1, inplace=True)
 
         if Q_weights is None:
@@ -146,10 +146,10 @@ class MiSiCNet_QinvU(nn.Module):
                                        nn.BatchNorm2d(128, eps=eps, momentum=0.1, affine=True, track_running_stats=True),
                                        nn.LeakyReLU(0.1, inplace=True),
                                        nn.Dropout(dropout))
-        self.fc1 = nn.Sequential(nn.Linear(in_features=int((((((((L-2)/2)-4)/2)-2)/2)-4)/2)**2 *128, out_features=(out_dim + CFG.add_noise) ** 2),
+        self.fc1 = nn.Sequential(nn.Linear(in_features=int((((((((L-2)/2)-4)/2)-2)/2)-4)/2)**2 *128, out_features=(out_dim + CFG.noise)**2),
                                  nn.GELU(), nn.Dropout(dropout),
-                                 nn.LayerNorm((out_dim + CFG.add_noise) ** 2)) ## [L,J + 1]
-        self.decoder = nn.Linear(in_features=out_dim + CFG.add_noise, out_features=L, bias=False)
+                                 nn.LayerNorm((out_dim + CFG.noise)**2)) ## [L,J + 1]
+        self.decoder = nn.Linear(in_features=out_dim + CFG.noise, out_features=L, bias=False)
         self.out_dim = out_dim
         self.apply(self.init_weights)
 
@@ -176,7 +176,7 @@ class MiSiCNet_QinvU(nn.Module):
         x= x + skip_connect2
         x = torch.flatten(x, start_dim=1)
         x = self.fc1(x) ##
-        Q_inverse = x.reshape(1, self.out_dim + CFG.add_noise, CFG.Q + CFG.add_noise)
+        Q_inverse = x.reshape(1, self.out_dim + CFG.noise,CFG.Q + CFG.noise)
 
         P = torch.matmul(self.U_matrix, Q_inverse)
 

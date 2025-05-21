@@ -12,7 +12,7 @@ from torchmetrics.functional.audio import scale_invariant_signal_distortion_rati
 CFG.set_mode('unsupervised')
 
 class SAD(nn.Module):
-    def __init__(self, Jplus1=CFG.Q+CFG.add_noise, epsilon=1e-10):
+    def __init__(self, Jplus1=CFG.Q+CFG.noise ,epsilon=1e-10):
         super(SAD, self).__init__()
         self.epsilon = epsilon
         self.Jplus1 = Jplus1

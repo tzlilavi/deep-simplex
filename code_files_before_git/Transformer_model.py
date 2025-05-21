@@ -182,7 +182,7 @@ class AutoEncoder(nn.Module):
     def __init__(self, J, L, size, patch, dim, eps = 1e-5, momentum = 0.9, Q_weights=None, pool='cls', find_vertices=False):
         super(AutoEncoder, self).__init__()
         self.name = 'Encoder'
-        J = J + CFG.add_noise  ## Add noise dim
+        J = J + CFG.noise  ## Add noise dim
         self.J, self.L, self.patch, self.dim = J, L, patch, dim
         self.size = (size // patch) * patch
         self.find_vertices = find_vertices
