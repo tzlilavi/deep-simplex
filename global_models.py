@@ -3,9 +3,8 @@ import torch.nn as nn
 import torch.nn.init as init
 import torch.nn.functional as F
 import numpy as np
-from utils import throwlow
 import CFG
-from einops import rearrange, repeat
+from einops import repeat
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
