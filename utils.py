@@ -1,6 +1,15 @@
-# import numpy as np
 
 def throwlow(p):
+    """
+    Remove low-activity segments from probability matrix `p` by zeroing values
+    that are not preceded or followed by strong speaker activity.
+
+    Args:
+        p (np.ndarray): [L, Q] matrix of speaker probabilities.
+
+    Returns:
+        np.ndarray: Smoothed probability matrix.
+    """
     L, Q = p.shape
     seg = 10
 
@@ -28,6 +37,18 @@ def throwlow(p):
 import numpy as np
 
 def FeatureExtr(S, F, d):
+    """
+        Extract normalized cross-channel STFT ratios for each microphone pair.
+
+        Args:
+            S (np.ndarray): STFT [F, T, M].
+            F (list): Frequency bin indices.
+            d (int): Temporal smoothing window size.
+
+        Returns:
+            Hl (np.ndarray): [lenF*(M-1), T] reshaped features.
+            Hlm (np.ndarray): [lenF, T, M-1] local features per mic.
+    """
     N_frames = S.shape[1]
     Mics = S.shape[2]
     lenF = len(F)
@@ -57,6 +78,17 @@ def FeatureExtr(S, F, d):
     return Hl, Hlm
 
 def findextremeSPA(E, QQ):
+    """
+        Run Successive Projection Algorithm (SPA) to find QQ extreme columns in E.
+
+        Args:
+            E (np.ndarray): [N, D] matrix of points.
+            QQ (int): Number of extremes to extract.
+
+        Returns:
+            ext (np.ndarray): Indices of selected extremes.
+            Qcov (int): Number of extremes with norm > threshold.
+    """
     Q = E.shape[1] + 1
     normE = np.sum(E ** 2, axis=1)
     ext = np.zeros(QQ, dtype=int)
@@ -74,23 +106,7 @@ def findextremeSPA(E, QQ):
     Qcov = np.where(maxq < 5)[0][0] if np.any(maxq < 5) else QQ
     return ext, Qcov    
 
-def MaskErr(Tmask, Emask, Q):
-    MDq = np.zeros(Q)
-    FAq = np.zeros(Q)
 
-
-    N_frames = Tmask.shape[1]
-    NFFT = Tmask.shape[0]
-    non_noise_num = np.sum(Tmask != Q)
-    for q in range(Q):
-        MDq[q] = np.sum(np.sum((Tmask == q) & (Emask != q))) / non_noise_num
-        FAq[q] = np.sum(np.sum((Tmask != q) & (Emask == q))) / non_noise_num
-
-    MD = np.mean(MDq)
-    FA = np.mean(FAq)
-    Acc = np.sum((Tmask == Emask) & (Tmask != Q) & (Emask != Q)) / non_noise_num
-    Err = 1 - Acc
-    return MD, FA, Err
 
 def smoother(C):
     L, Q = C.shape

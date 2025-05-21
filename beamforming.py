@@ -1,6 +1,5 @@
 import numpy as np
 from scipy.signal import istft, get_window, resample_poly, resample, decimate, firwin, filtfilt
-
 from scipy.linalg import eigh, solve
 from mir_eval.separation import bss_eval_sources
 import CFG
@@ -10,27 +9,6 @@ import torch
 import itertools
 import matplotlib.pyplot as plt
 
-def beamformer(Xt, mask, xq, Q, fh, olap, lens, a, b, apply_mask, fs, att=0.3):
-    N_frames = Xt.shape[1]
-    NFFT = 2 * (Xt.shape[0] - 1)
-
-    H, R, _ = RTFsmaskandNoiseCovEst2(Xt, Xt, mask, Q, fh)
-    y, Y = lcmv_noise(Xt, H, R, olap, lens, a, b, fs)
-
-    leni = int((N_frames - 1) * (1-olap) * NFFT)
-    if apply_mask:
-        ym = np.zeros_like(y)
-        for q in range(Q):
-            Ym = Y[:, :, q] * ((mask == q) + (mask != q) * att)
-            ym[:, q] = istft(Ym, nperseg=NFFT, noverlap=olap * NFFT, nfft=NFFT, fs=fs)[1][:ym[:, q].shape[0]]
-    else:
-        ym = y
-
-    SDRq, SIRq, _, _ = bss_eval_sources(np.real(ym).T, np.squeeze(xq[:, 0, :]).T)
-    SDR = np.mean(SDRq)
-    SIR = np.mean(SIRq)
-
-    return SDR, SIR, ym
 
 def beamformer_C(Xt, mask, xq, Q, fh, olap, lens, a, b, apply_mask, fs, att, C):
     N_frames = Xt.shape[1]
@@ -154,8 +132,28 @@ def compute_R_xt(Xt):
         R[:, :, f] += 1e-6 * np.eye(M)     # regularization
     return R
 
-def beamformer_nonoise(Xt, mask, xq, Q, fh, olap, lens, a, apply_mask, fs, att=0.3,  Xq=None, Hq=None, Hl=None, C=None,
-                       b=0.01):
+def beamformer(Xt, mask, xq, Q, fh, olap, lens, a, apply_mask, fs, att=0.3, Xq=None, Hq=None, Hl=None, C=None,
+               b=0.01):
+    """
+        Perform LCMV beamforming to separate sources from multichannel input.
+
+        Args:
+            Xt (np.ndarray): [F, T, M] STFT of the mixture.
+            mask (np.ndarray): [F, T] time-frequency mask (e.g., from NN or oracle).
+            xq (np.ndarray): [T, M, Q] ground truth time-domain sources.
+            Q (int): Number of sources.
+            fh (list): Top time-frame indices per source (used for RTF estimation).
+            olap (float): STFT overlap fraction.
+            lens (int): Length of output waveform.
+            a (float): LCMV regularization parameter.
+            apply_mask (bool): Whether to apply TF masks after beamforming.
+            fs (int): Sampling rate.
+            att (float): Attenuation factor for non-target bins when masking.
+            Xq, Hq, Hl, C, b: Optional overrides for beamforming.
+
+        Returns:
+            Tuple[float, float, np.ndarray]: SDR, SI-SDR, separated waveform [T, Q]
+        """
     N_frames = Xt.shape[1]
     NFFT = 2 * (Xt.shape[0] - 1)
     if Hq is not None:
@@ -193,8 +191,6 @@ def beamformer_nonoise(Xt, mask, xq, Q, fh, olap, lens, a, apply_mask, fs, att=0
                 ym[:, q] = istft(Ym, nperseg=NFFT, noverlap=olap * NFFT, nfft=NFFT, fs=fs)[1][:ym[:, q].shape[0]]
     else:
         ym = y
-    # ym /= CFG.stft_scaling
-    # SDRq, SIRq, _, _ = bss_eval_sources(np.real(ym).T, np.squeeze(xq[:, 0, :]).T)
 
 
     if CFG.resample_flag:
@@ -253,39 +249,6 @@ def lcmv_nonoise(Xt, H, olap, lens, a, fs):
     leni = (L - 1) * olap * NFFT + NFFT
     for q in range(Q):
         yo[:, q] = istft(Yo[:, :, q], nperseg=NFFT, noverlap=olap * NFFT, nfft=NFFT, fs=fs)[1][:yo.shape[0]]
-
-    return yo, Yo
-
-def lcmv_try(Xt, H, olap, lens, fs, epsilon=1e-6):
-    NFFT = 2 * (Xt.shape[0] - 1)
-    F = Xt.shape[0]
-    T = Xt.shape[1]
-    M = Xt.shape[2]
-    Q = H.shape[2]
-
-    Yo = np.zeros((F, T, Q), dtype=np.complex128)
-
-    for q in range(Q):
-        for k in range(F):
-            x_k = Xt[k, :, :]  # shape: T × M
-
-            # Estimate spatial covariance matrix from all frames
-            R_k = x_k.conj().T @ x_k / T
-            R_k += epsilon * np.eye(M)  # regularization
-
-            h_k = H[k, :, q]  # shape: M
-
-            numerator = np.linalg.solve(R_k, h_k)
-            denominator = h_k.conj().T @ numerator + 1e-8  # avoid divide by 0
-            w_k = numerator / denominator  # shape: M
-
-            # Apply beamformer to all T frames at this frequency
-            Yo[k, :, q] = x_k @ w_k.conj()
-
-    # ISTFT
-    yo = np.zeros((lens, Q), dtype=np.complex128)
-    for q in range(Q):
-        yo[:, q] = istft(Yo[:, :, q], nperseg=NFFT, noverlap=int(olap * NFFT), nfft=NFFT, fs=fs)[1][:lens]
 
     return yo, Yo
 
@@ -420,33 +383,8 @@ def apply_beamforming_weights(signals, weights):
 
 def mvdr_weights(mixture_stft, h):
     C, F, T = mixture_stft.shape  # (mics, freq, time)
-    # R_y = np.einsum('a...c,b...c', mixture_stft, np.conj(mixture_stft)) / T
-    #
-    # R_y = condition_covariance(R_y, 1e-6)
-    # R_y /= np.trace(R_y, axis1=-2, axis2=-1)[..., None, None] + 1e-15
-    #
-    #
-    # W = np.zeros((F, C), dtype='complex128')
-    # eps = 1e-6
-    #
-    # for i, r, _h in zip(range(F), R_y, h):
-    #     part = solve(r + np.eye(C) * eps, _h)   # Regularized inverse
-    #
-    #     W[i, :] = part / np.conj(_h).T.dot(part)
     W = np.zeros((F, C), dtype='complex128')
     for f in range(F):
         mult = np.linalg.pinv(np.cov(mixture_stft[:, f])) @ h[f]
         W[f, :] = mult / (h[f].conj().T @ mult)
-
-
     return W
-
-
-def condition_covariance(x, gamma):
-    """Code borrowed from https://github.com/fgnt/nn-gev/blob/master/fgnt/beamforming.py
-    Please refer to the repo and to the paper (https://ieeexplore.ieee.org/document/7471664) for more information.
-    see https://stt.msu.edu/users/mauryaas/Ashwini_JPEN.pdf (2.3)"""
-    scale = gamma * np.trace(x, axis1=-2, axis2=-1)[..., None, None] / x.shape[-1]
-    n = len(x.shape) - 2
-    scaled_eye = np.eye(x.shape[-1], dtype=x.dtype)[(None, ) * n] * scale
-    return (x + scaled_eye) / (1 + gamma)

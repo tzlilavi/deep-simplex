@@ -98,7 +98,7 @@ dropout = None
 K_dropout = None
 run_multiple_initializations = False
 fixed_mask_input_ratio = None
-mask_input_ratio = None
+
 random_input = False
 if random_input:
     epochs=1000

@@ -268,7 +268,7 @@ def comparing_wins(wins_over_comparison_dict, scores, comparing_suff1, comparing
        Updates:
            wins_over_comparison_dict is updated in-place, incrementing a metric key
            if model 1 wins on that metric against model 2.
-       """
+   """
     if scores[f"L2_P_{comparing_suff1}"] <= scores[f"L2_P_{comparing_suff2}"]:  # Smaller is better for L2
         wins_over_comparison_dict["L2_P"] += 1
     if scores[f"MD_{comparing_suff1}"] <= scores[f"MD_{comparing_suff2}"]:  # Smaller is better for MD
@@ -298,7 +298,7 @@ def compute_avg_std(metrics, suffix, avg_results, std_results):
 
         Returns:
             list of str: Formatted "AVG ± STD" strings for each metric.
-        """
+    """
     metric_names = [f"{metric}_{suffix}" for metric in metrics]
     avg_std_list = [
         f"{avg_results[m]:.3f} ± {std_results[m]:.3f}" for m in metric_names
@@ -319,7 +319,7 @@ def compute_comparison_table(results, num_test_runs, comparison_pairs, method_su
 
         Returns:
             pd.DataFrame: Comparison table with AVG±STD and win ratios.
-        """
+    """
     metrics = ["L2_P", "Err", "MD", "FA", "SDR", "si-sdr", "pesq", "stoi"]
     df = pd.DataFrame(results)
 
@@ -378,7 +378,7 @@ def run_scenario(J, num_test_runs=30, overlap_demand=None, rev=CFG.low_rev, sign
 
        Returns:
            pd.DataFrame: Comparison table of results with AVG±STD and win ratios.
-       """
+   """
     reset_all_seeds()
     CFG.Q = J
     previous_combinations = set()

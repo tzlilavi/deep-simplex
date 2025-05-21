@@ -1,44 +1,34 @@
-import torch
 import os
+import random
+
 import joblib
-import random
-import pandas as pd
-import torch.nn as nn
-import torch.optim as optim
 import numpy as np
-import math
-import scipy
-import torch.nn.functional as F
-from torch.optim.lr_scheduler import StepLR, CyclicLR
-from itertools import product
-import random
-import matplotlib.pyplot as plt
-import CFG
-CFG.set_mode('unsupervised')
 import optuna
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
-from MiSiCNet import MiSiCNet2
-from LSTMs import BiLSTM_Att
-from Transformer_model import AutoEncoder
-from functions import compute_rmse, plot_metrics, plot_heat_mat, cosine_sim, throwlow, plot_results, audio_scores, plot_masks, local_mapping
-from custom_losses import SAD, NonZeroClipper, Unsupervised_Loss, Unsupervised_Loss_try, Unsupervised_Loss_tryyy, find_best_permutation_unsupervised, LocalLoss, find_best_permutation_supervised, SupervisedLoss
-from LocalNets import SpatialNet
-import itertools
-from scipy.stats import pearsonr
-from sklearn.cluster import KMeans
-from sklearn.metrics import silhouette_score
-import copy
+
+import CFG
+from local_models import SpatialNet
+from global_models import BiLSTM_Att, MiSiCNet2, AutoEncoder
+from custom_losses import LocalLoss, SupervisedLoss, Unsupervised_Loss, find_best_permutation_supervised
+from functions import audio_scores, local_mapping, plot_masks, throwlow
+
 torch.manual_seed(42)
 
 
 def run_global_model(model, input, W, loss_function, num_epochs, lr=CFG.lr, max_norm=CFG.clip_grad_max,
                      betas=(0.9, 0.999), dropout=CFG.dropout, K_dropout=None,
-                     param_search=CFG.param_search_flag, plot_loss=False, mask_input_ratio=None,
+                     param_search=CFG.param_search_flag, plot_loss=False,
                      noise_col=CFG.noise_col, add_noise=CFG.add_noise):
-
+    """
+        Train the global deep model using unsupervised loss. Supports optional dropout inference and masking.
+    """
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=CFG.weight_decay, betas=betas)
-
-
     scheduler = StepLR(optimizer, step_size=15, gamma=0.8)
 
 
@@ -49,22 +39,14 @@ def run_global_model(model, input, W, loss_function, num_epochs, lr=CFG.lr, max_
     best_loss = float('inf')
     patience = 30
     patience_counter = 0
-
     losses = []
-    mask=None
+    mask = None
     if CFG.pad_flag:
         W_target = F.pad(W_target, (0, CFG.pad_tfs, 0, CFG.pad_tfs))
         input = F.pad(input, (0, CFG.pad_tfs, 0, CFG.pad_tfs))
 
     for epoch in range(num_epochs):
-
         model.train()
-
-        if mask_input_ratio and (epoch % 10)==0:
-            mask = mask_input(input, mask_ratio=mask_input_ratio)
-            mask = mask.to(CFG.device)
-            input = input * mask
-            # W_target = W_target * mask
 
         P_output, W_output, E_output, A_output = model(input, epoch)
 
@@ -72,26 +54,14 @@ def run_global_model(model, input, W, loss_function, num_epochs, lr=CFG.lr, max_
         loss, loss_SAD, loss_RE, PPt_output = (
             loss_function(P_output, W_target, mask, W_output, E_output, epoch=epoch))
 
-        # if epoch == CFG.speakers_epoch_TH-1 or epoch ==0:
-        #     early_loss = loss.item()
 
         optimizer.zero_grad()
-
         loss.backward()
-
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm, norm_type=1)
-        # if epoch % 10 == 0:
-        #     print("=== Gradient Norms ===")
-        #     for name, param in model.named_parameters():
-        #         if param.grad is not None and ("blstm1" in name or "Conv1" in name):
-        #             grad_norm = param.grad.norm().item()
-        #             print(f"{name}: {grad_norm:.4e}")
         optimizer.step()
-
-        losses.append(loss.item())
-
         scheduler.step()
 
+        losses.append(loss.item())
 
         if not param_search:
             if epoch % 10 == 0:
@@ -107,6 +77,8 @@ def run_global_model(model, input, W, loss_function, num_epochs, lr=CFG.lr, max_
             if patience_counter >= patience:
                 print(f"Early stopping at epoch {epoch}")
                 break
+
+    # Test-time dropout averaging if configured
     if K_dropout and dropout > 0:
         P_output = MC_dropout_averaging(model, input, K = K_dropout)
 
@@ -121,27 +93,28 @@ def run_global_model(model, input, W, loss_function, num_epochs, lr=CFG.lr, max_
         P_noise = P_output[:, :,-1].detach().cpu().numpy().squeeze(0)
         if not add_noise:
             P_output = P_output[:, :, :-1]
-    d = {}
-    d['model_name'] = model.name
-    d['lr'] = CFG.lr
-    d['epochs'] = num_epochs
-    d['loss_name'] = loss_function.name
-    d['loss'] = round(loss.item(), 4)
-    d['output_mat'] = P_output.detach()
-    d['P_torch'] = P_output.detach()
-    d['A'] = A_output.detach()
-    d['P_noise'] = P_noise
-    return d
+    return {
+        'model_name': model.name,
+        'lr': CFG.lr,
+        'epochs': num_epochs,
+        'loss_name': loss_function.name,
+        'loss': round(loss.item(), 4),
+        'output_mat': P_output.detach(),
+        'P_torch': P_output.detach(),
+        'A': A_output.detach(),
+        'P_noise': P_noise
+    }
 
 def MC_dropout_averaging(model, input, K=5):
-    P_sum = 0
+    """Average multiple forward passes with dropout enabled."""
     model.train()
     print(f'Running MC dropout averaging for K = {K}')
     with torch.no_grad():
         P_samples = [model(input)[0] for _ in range(K)]
-
     return torch.stack(P_samples).mean(dim=0)
+
 def mask_input(input, mask_ratio=0.15):
+    """Random binary mask for symmetric 1xLxL input matrix."""
     B, L, L = input.shape
     mask = torch.rand(B, L, L, device=input.device) > mask_ratio  # Randomly mask values
     return mask
@@ -153,7 +126,9 @@ def global_method(input_mat, W_torch, first_non0, pr2, low_energy_mask_time, J=C
                   dropout=CFG.dropout, K_dropout=None, run_multiple_initializations=CFG.run_multiple_initializations
                   , mask_input_ratio=CFG.mask_input_ratio, fixed_mask_input_ratio=CFG.fixed_mask_input_ratio,
                   noise_col=CFG.noise_col, add_noise=CFG.add_noise):
-
+    """
+        Initialize and train a global deep model. Optionally run multiple initializations and reorder outputs.
+    """
     mask = None
     if fixed_mask_input_ratio:
         print('Masking input with fixed ratio...')
@@ -171,7 +146,7 @@ def global_method(input_mat, W_torch, first_non0, pr2, low_energy_mask_time, J=C
                         n_heads=n_heads, seed=seed ,low_energy_mask = low_energy_mask_time, dropout=dropout).to(CFG.device)
         loss_function = Unsupervised_Loss(first_non0=first_non0, P_method=P_method, input_mask=mask, noise_col=noise_col)
         deep_dict = run_global_model(model, input_mat, W_torch, loss_function, epochs, lr, param_search=param_search_flag, betas=betas,
-                                     dropout=dropout, K_dropout=K_dropout, mask_input_ratio=mask_input_ratio,
+                                     dropout=dropout, K_dropout=K_dropout,
                                      noise_col=noise_col, add_noise=add_noise)
     else:
         seeds = [seed, 0, 42]
@@ -190,13 +165,14 @@ def global_method(input_mat, W_torch, first_non0, pr2, low_energy_mask_time, J=C
         print(f'Different init losses: {losses}')
         deep_dict = dicts[np.argmin(losses)]
 
-
+    # Best output
     P = deep_dict['output_mat']
 
+    # Align output speakers to compare to ideal pr2
     loss_function = SupervisedLoss(L2_factor=L2_factor, SAD_factor=SAD_factor)
     _, P, best_permutation, _, _ = find_best_permutation_supervised(loss_function, P.to(CFG.device), torch.from_numpy(pr2).unsqueeze(0).float().to(CFG.device))
 
-
+    # Remove negative values and normalize rows that exceed simplex constraints
     P = P.cpu().numpy().squeeze(0)
     P = throwlow(P)
     P[P.sum(1) > 0, :] = P[P.sum(1) > 0, :] / P[P.sum(1) > 0, :].sum(1, keepdims=True)
@@ -209,7 +185,20 @@ def global_method(input_mat, W_torch, first_non0, pr2, low_energy_mask_time, J=C
 
 
 def run_local_model(model, P, R, loss_function, num_epochs=CFG.epochs_local, lr=CFG.lr_local, max_norm=CFG.clip_grad_max, betas=CFG.betas, param_search=CFG.param_search_flag, plot_loss=False):
+    """
+        Train the local model to predict soft masks from RTF pre frequency (Hlf) and global P.
 
+        Args:
+            model (nn.Module): Local model (e.g., SpatialNet).
+            P (torch.Tensor): Global speaker probabilities [1, L, J].
+            R (torch.Tensor): Real-valued RTF-like features [1, F, L, 2(M-1)].
+            loss_function (nn.Module): Local loss.
+            num_epochs (int): Number of training epochs.
+            lr (float): Learning rate.
+
+        Returns:
+            dict: Dictionary with model outputs and metadata.
+    """
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=CFG.weight_decay, betas=betas)
     scheduler = StepLR(optimizer, step_size=15, gamma=0.8)
 
@@ -239,8 +228,6 @@ def run_local_model(model, P, R, loss_function, num_epochs=CFG.epochs_local, lr=
 
         loss, loss_1, loss_2 = loss_function(mask_output, R=R.unsqueeze(0), P=P.unsqueeze(0))
 
-        # if epoch == CFG.speakers_epoch_TH-1 or epoch ==0:
-        #     early_loss = loss.item()
 
         optimizer.zero_grad()
 
@@ -286,6 +273,14 @@ def run_local_model(model, P, R, loss_function, num_epochs=CFG.epochs_local, lr=
 def deep_local_masking(Xt, P, Hlf, Tmask, Emask=None, P_method=CFG.P_method, J=CFG.Q, plot_mask=False, plot_loss=False, lr=CFG.lr_local, betas=CFG.betas, RTF_factor=CFG.RTF_factor, global_factor=CFG.global_factor, epochs=CFG.epochs_local,
                        num_layers=CFG.num_layers, dim_squeeze=CFG.dim_squeeze, encoder_kernel_size=CFG.encoder_kernel_size, kernel_size=CFG.kernel_size, conv_groups=CFG.conv_groups,
                        param_search=CFG.param_search_flag, local_init_seed=CFG.local_init_seed, low_energy_mask=None):
+    """
+        Train SpatialNet to predict local TF masks from RTF features and global speaker probabilities.
+
+        Returns:
+            - dict: Training metadata and mask output.
+            - np.ndarray: Soft mask [L, J].
+            - np.ndarray: Hard mask [L] with speaker labels.
+    """
     print("Running Deep Local Mapping...")
     local_loss = LocalLoss(RTF_factor=RTF_factor, global_factor=global_factor).to(CFG.device)
     local_model = SpatialNet(num_layers=num_layers, dim_squeeze=dim_squeeze, encoder_kernel_size=encoder_kernel_size,
@@ -294,10 +289,6 @@ def deep_local_masking(Xt, P, Hlf, Tmask, Emask=None, P_method=CFG.P_method, J=C
 
     deep_mask_soft = deep_dict_local['deep_mask'].squeeze(0).detach().cpu().numpy()
     deep_mask_hard = deep_mask_soft.argmax(axis=-1)
-    # local_ths = find_local_thresholds(deep_mask_soft, P, num_ths=30)
-    # deep_mask_hard = J * np.ones((CFG.lenF0, CFG.N_frames))
-    # for j in range(J):
-    #     deep_mask_hard[deep_mask_soft[:,:,j] > local_ths[j]] = j
 
     deep_mask_hard[low_energy_mask] = J
 
@@ -305,151 +296,6 @@ def deep_local_masking(Xt, P, Hlf, Tmask, Emask=None, P_method=CFG.P_method, J=C
         plot_masks(Tmask, deep_mask_hard, Emask, P_method=P_method)
 
     return deep_dict_local, deep_mask_soft, deep_mask_hard
-
-def find_local_thresholds(deep_mask_soft, P, num_ths=30, F=CFG.lenF0, L=CFG.N_frames):
-    th_arr = np.linspace(0.01, 0.99, num_ths)
-    P_bigger_than_th = np.sum(P[:, :, None] > th_arr, axis=0) / L
-    mask_bigger_than_th = np.sum(deep_mask_soft[:, :, :, None] > th_arr, axis=(0, 1)) / (L * F)
-    diffs = abs(P_bigger_than_th - mask_bigger_than_th)
-    best_ths = th_arr[np.argmin(diffs, axis=1)]
-    return best_ths
-
-def run_model_unknown_J(model, input_matrix, W, loss_function, num_epochs, lr=CFG.lr, U_target=None, max_norm=CFG.clip_grad_max, param_search=CFG.param_search_flag):
-
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=CFG.weight_decay)
-    scheduler = StepLR(optimizer, step_size=15, gamma=0.8)
-    if isinstance(U_target, dict):
-        U_target = {key: value.to(CFG.device) for key, value in U_target.items()}
-    else:
-        U_target = U_target.to(CFG.device)
-    loss_function = Unsupervised_Loss(U_target=U_target)
-
-    input_matrix = input_matrix.to(CFG.device)
-    W_target = W.to(CFG.device)
-
-
-    best_loss = float('inf')
-    patience = 30
-    patience_counter = 0
-    losses = []
-    head_losses = {3: [], 4: [], 5: []}  # To track losses for each head
-    loss_weights = np.arange(3, 6)
-    total_loss = 0
-    init_losses = float('inf')
-    tfs_diffs = []
-    sil_scores = []
-    coeffs_scores = []
-    for epoch in range(num_epochs):
-        model.train()
-
-        # Forward pass
-        optimizer.zero_grad()
-        P_output, W_output, E_output, U_output = model(input_matrix)
-        # Compute loss for each head if before speakers_epoch_TH
-        if epoch <= CFG.speakers_epoch_TH:
-            total_loss = 0
-            loss_per_head = []
-            lossU_per_head = []
-            SAD_loss_per_head = []
-            MSE_loss_per_head = []
-            SAD_loss_per_head2 = []
-            MSE_loss_per_head2 = []
-            abs_diffs = []
-            P_heads = []
-            PPts = []
-
-            for head_idx, weight in zip(range(3, 6), [1.3, 1.4, 1.5]):
-                P_head = P_output[head_idx]
-                U_head = U_output[head_idx]
-                loss, loss2, _, sad_loss, loss_RE, sad_loss2, loss_RE2, _, PPt_output = find_best_permutation_unsupervised(
-                    loss_function,
-                    P_head,
-                    W_target,
-                    W_output=W_output,
-                    E_output=E_output,
-                    U=U_head
-                )
-                total_loss += loss
-                PPts.append(PPt_output)
-                abs_diffs.append(torch.abs(PPt_output-W_target))
-                P_heads.append(P_head.squeeze(0))
-                lossU_per_head.append(loss2.item())
-                loss_per_head.append(loss.item())
-                SAD_loss_per_head.append(sad_loss.item())
-                MSE_loss_per_head.append(loss_RE.item())
-                SAD_loss_per_head2.append(sad_loss2.item())
-                MSE_loss_per_head2.append(loss_RE2.item())
-
-
-                head_losses[head_idx].append(loss.item())
-            if epoch == 0:
-                init_losses = np.array(loss_per_head.copy())
-
-            total_loss.backward()
-            loss_per_head = np.array(loss_per_head)
-            loss_diffs_head = init_losses-loss_per_head
-            selected_head_idx = np.argmin(np.array(loss_per_head * loss_weights))
-            max_diff_idx = np.argmax(loss_diffs_head)
-            max_diff_weighted_idx = np.argmax( loss_diffs_head * loss_weights)
-
-
-            # print(f"Epoch {epoch}, Min weighted loss is for {selected_head_idx + 3} speakers with loss: {loss_per_head[selected_head_idx]}")
-            # print(f"Epoch {epoch}, Min weighted loss is for {selected_head_idx + 3} speakers with loss diff: {(init_losses-loss_per_head)[selected_head_idx]}")
-            if epoch == CFG.speakers_epoch_TH:
-                for P, n_clusters in zip(P_heads, [3,4,5]):
-                    P_np = P.squeeze(0).detach().cpu().numpy()
-
-                # print(f"Selected speakers num: {selected_head_idx + 3}")
-                losses = head_losses[head_idx]
-
-                return selected_head_idx
-        else:
-            selected_head = P_heads[selected_head_idx]
-            loss, P_output, best_sad_loss, best_loss_RE, best_diagonal_loss, PPt_output = find_best_permutation_unsupervised(loss_function, selected_head,
-                                                                                                                             W_target, W_output=W_output,
-                                                                                                                             E_output=E_output, U=U_output)
-            losses.append(loss.item())
-            loss.backward()
-
-
-        optimizer.step()
-        scheduler.step()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm, norm_type=1)
-
-
-
-        if not param_search and epoch % 10 == 0 and epoch > CFG.speakers_epoch_TH:
-            print(
-                f"Epoch {epoch + 1}/{num_epochs}, Loss: {loss.item()}, "
-                f"SAD_loss: {best_sad_loss.item()}, loss_RE: {best_loss_RE.item()}"
-            )
-        # Early stopping
-        if best_loss > loss:
-            best_loss = loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch}")
-                break
-
-    # Final evaluation
-    model.eval()
-
-    # Return details
-    d = {}
-    d['model_name'] = model.name
-    d['lr'] = CFG.lr
-    d['epochs'] = num_epochs
-    d['loss_name'] = loss_function.name
-    d['loss'] = round(loss.item(), 4)
-    d['output_mat'] = P_output.detach()
-    d['P_torch'] = P_output.detach()
-
-    return d
-
-
-
 
 def load_all_dicts(folder_path="array_data"):
     """Load all .pkl files and return a list of dictionaries."""
@@ -459,7 +305,6 @@ def load_all_dicts(folder_path="array_data"):
 
 def objective_local(trial):
     """Objective function for Optuna hyperparameter tuning."""
-
     # Define hyperparameter search space
     seed = trial.suggest_int("seed", 0, 9999)
     lr_local = trial.suggest_categorical("lr_local", [5 * 1e-5, 5 * 1e-4, 5 * 1e-3, 5 * 1e-2, 5 * 1e-1])

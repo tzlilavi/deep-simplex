@@ -1,53 +1,80 @@
-import os
+import itertools
 import joblib
-import numpy as np
-import glob
-import torch.nn as nn
-from openpyxl.descriptors import NoneSet
-from scipy import signal
-from scipy.io import wavfile
-from scipy.signal import decimate, stft
-import matplotlib.pyplot as plt
+import os
+import random
+
 import matplotlib.colors as mcolors
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
 from pesq import pesq
 from pystoi import stoi
+from scipy import signal
+from scipy.spatial import distance_matrix
+from sklearn.metrics import mean_squared_error
+
 import CFG
-from custom_losses import find_best_permutation_supervised, SupervisedLoss
 import torchiva
+from beamforming import beamformer, bss_eval_sources, MVDR_over_speakers
+from custom_losses import find_best_permutation_supervised, SupervisedLoss
 from torchmetrics.functional.audio import scale_invariant_signal_distortion_ratio as t_audio_SI_SDR
 from torchmetrics.functional.audio import signal_distortion_ratio as t_audio_SDR
-from utils import throwlow, findextremeSPA, FeatureExtr, MaskErr, smoother
-from beamforming import beamformer, beamformer_nonoise, bss_eval_sources, MVDR_over_speakers
-from sklearn.metrics import mean_squared_error
-from scipy.spatial import distance_matrix
-from tqdm import trange
-import random
-import torch
-import itertools
-from itertools import permutations
-import soundfile as sf
-from pyroomacoustics.bss.ilrma import ilrma
+from utils import throwlow, findextremeSPA, FeatureExtr, smoother
+
 random.seed(CFG.seed0)
 np.random.seed(CFG.seed0)
 
 
 def feature_extraction(Xt):
-    d = 2
-    Hl, Hlm = FeatureExtr(Xt, CFG.F0, d)
-    F = np.arange(int(np.ceil(CFG.f1 * CFG.NFFT / CFG.fs)), int(np.floor(CFG.f2 * CFG.NFFT / CFG.fs)) + 1)
-    lenF = len(F)
-    Fall = (np.tile(np.arange(0, CFG.lenF0 * (CFG.M - 2) + 1, CFG.lenF0), (lenF, 1)) + np.tile(F.reshape(-1, 1), (
-    1, CFG.M - 1))).flatten()
+    """
+    Extracts features from the multichannel STFT signal.
 
+    Args:
+        Xt (np.ndarray): STFT matrix of shape [freq_bins, time_frames, num_mics]
+
+    Returns:
+        Hl (np.ndarray): Full set of features.
+        Hlm (np.ndarray): Mean-normalized features or similar (from FeatureExtr).
+        Hlf (np.ndarray): Normalized feature tensor used in model input [freq x time x features].
+        Fall (np.ndarray): Indices of selected frequency bins across microphones.
+        lenF (int): Number of selected frequencies in band [f1, f2].
+        F (np.ndarray): Array of frequency bin indices in the selected band.
+    """
+
+    d = 2 # Window length for local averaging used in FeatureExtr
+
+    # Extract raw coherence features between mic 0 and others
+    Hl, Hlm = FeatureExtr(Xt, CFG.F0, d)
+
+    # Define frequency band of interest based on f1 and f2
+    F = np.arange(
+        int(np.ceil(CFG.f1 * CFG.NFFT / CFG.fs)),
+        int(np.floor(CFG.f2 * CFG.NFFT / CFG.fs)) + 1
+    )
+    lenF = len(F)
+
+    # Compute the flattened frequency indices to extract from Hl
+    Fall = (
+            np.tile(np.arange(0, CFG.lenF0 * (CFG.M - 2) + 1, CFG.lenF0), (lenF, 1))
+            + np.tile(F.reshape(-1, 1), (1, CFG.M - 1))
+    ).flatten()
+
+    # Prepare normalized features across all frequencies
     Hlf = np.zeros((CFG.lenF0, CFG.N_frames, (CFG.M - 1) * 2), dtype=complex)
+
     for kk in range(CFG.NFFT // 2 + 1):
         Lb = 1
         Fk = np.array([kk])
-        Fall_f = np.tile(np.arange(0, CFG.lenF0 * (CFG.M - 1), CFG.lenF0)[:, np.newaxis], (1, Lb)) + np.tile(
-            Fk[np.newaxis, :],(CFG.M - 1, 1))
-        Fall_f = Fall_f.flatten()
+        # Determine frequency indices for this bin
+        Fall_f = (
+                np.tile(np.arange(0, CFG.lenF0 * (CFG.M - 1), CFG.lenF0)[:, np.newaxis], (1, Lb))
+                + np.tile(Fk[np.newaxis, :], (CFG.M - 1, 1))
+        ).flatten()
 
+        # Stack real and imaginary parts
         hlf = np.concatenate((np.real(Hl[Fall_f, :]), np.imag(Hl[Fall_f, :])), axis=0)
+
+        # Normalize per time frame
         mnorm = np.sqrt(np.sum(hlf ** 2, axis=0))
         Hlf[kk, :, :] = (hlf / np.tile((mnorm + 1e-12), ((CFG.M - 1) * Lb * 2, 1))).T
 
@@ -55,8 +82,34 @@ def feature_extraction(Xt):
 
 
 def calculate_W_U_realSimplex(Hl, Fall, Tmask, lenF, F, J=CFG.Q, file=None, add_noise=CFG.add_noise):
+    """
+        Computes the normalized input matrix Hln, its outer product W (KK), its eigen-decomposition,
+        and the initial probability estimates pr2.
+
+        Args:
+            Hl (np.ndarray): Coherence features matrix, shape [(M-1)*lenF, N_frames]
+            Fall (np.ndarray): Frequency indices used to select features
+            Tmask (np.ndarray): Ground truth time-frequency mask of shape [freq_bins, time_frames]
+            lenF (int): Number of frequency bins in the selected range
+            F (np.ndarray): Frequency bin indices used for Tmask
+            J (int): Number of sources (default: CFG.Q)
+            file: (Unused, legacy)
+            add_noise (bool): Whether to add a noise column to pr2
+
+        Returns:
+            Hln (np.ndarray): Normalized real feature matrix, shape [features, time_frames]
+            KK (np.ndarray): Input outer product matrix W = Hln.T @ Hln, shape [L, L]
+            E0 (np.ndarray): Eigenvectors of KK
+            pr2 (np.ndarray): Estimated global probabilities per frame (L x (J + noise))
+            first_nonzero_l (int): First index where diagonal of KK > 0.9
+    """
+
+    # Replace NaNs with zeros
     Hl = np.nan_to_num(Hl, nan=0)
+    # Build real feature matrix by concatenating real and imaginary parts of selected frequencies
     Hlf = np.concatenate((np.real(Hl[Fall, :]), np.imag(Hl[Fall, :])), axis=0)
+
+    # Build W matrix (KK)
     mnorm = np.sqrt(np.sum(Hlf ** 2, axis=0))
     Hln = Hlf / (np.tile(mnorm + 1e-12, ((CFG.M - 1) * lenF * 2, 1)))
     Hln[:, 0] = np.mean(Hln[:, 0:], axis=1)
@@ -65,16 +118,12 @@ def calculate_W_U_realSimplex(Hl, Fall, Tmask, lenF, F, J=CFG.Q, file=None, add_
     diag = KK[range(CFG.N_frames), range(CFG.N_frames)]
     first_nonzero_l = np.where(diag > 0.9)[0][0]
 
-
+    # Estimate probability matrix from Tmask (ground truth frame-level label proportions)
     pr2 = np.zeros((CFG.N_frames, J + CFG.add_noise))
     for q in range(J + add_noise):
         pr2[:, q] = np.sum(Tmask[F, :] == q, axis=0) / lenF
 
-    # if CFG.pad_flag:
-    #     de, E0 = np.linalg.eig(KK[CFG.pad_tfs:-CFG.pad_tfs, CFG.pad_tfs:-CFG.pad_tfs])
-    #     pr2[:CFG.pad_tfs, :] = 0
-    #     pr2[-CFG.pad_tfs:, :] = 0
-    # else:
+    # Eigen-decomposition of W to get E0 (U)
     de, E0 = np.linalg.eig(KK)
     d_sorted = np.sort(de)[::-1]
     E0 = E0[:, np.argsort(de)[::-1]]
@@ -82,19 +131,37 @@ def calculate_W_U_realSimplex(Hl, Fall, Tmask, lenF, F, J=CFG.Q, file=None, add_
 
 
 def calculate_SPA_simplex(E0, pr2, J, add_noise=CFG.add_noise):
+    """
+        Estimates the speaker probability matrix (pe) using the SPA (Successive Projection Algorithm)
+        on the eigenvector matrix E0 and aligns it to the ground truth probability matrix pr2.
+
+        Args:
+            E0 (np.ndarray): Eigenvector matrix (NxJ).
+            pr2 (np.ndarray): Ground truth probability matrix (Nx(J+1)).
+            J (int): Number of sources (speakers).
+            add_noise (bool): Whether to append a noise column (1 - row sum) to pe.
+
+        Returns:
+            pe (np.ndarray): Estimated speaker probability matrix after SPA and alignment.
+            id0 (np.ndarray): Indices of the speakers most associated with each extracted vertex.
+            ext0 (np.ndarray): Indices of the extracted extreme points in E0.
+    """
+    # Extract J extreme indices using SPA
     ext0, _ = findextremeSPA(E0[:, :J], J)
 
+    # For each extreme point, find the index of the most dominant speaker (argmax over pr2)
     id0 = np.argmax(pr2[ext0, :J], axis=0)
-    # id0 = ensure_permutation(id0, J)
 
+    # Compute projection of E0 onto the subspace defined by the extracted extremes
     pe = np.dot(E0[:, :J], np.linalg.inv(E0[ext0, :J]))
+    # Remove negative values and normalize rows that exceed simplex constraints
     pe = pe * (pe > 0)
     pe[pe.sum(1) > 1, :] = pe[pe.sum(1) > 1, :] / pe[pe.sum(1) > 1, :].sum(1, keepdims=True)
     pe = throwlow(pe)
     if add_noise:
         pe = np.hstack((pe, 1 - pe.sum(1, keepdims=True)))
 
-
+    # Align estimated pe with ground truth pr2 using supervised loss and permutation matching
     loss_function = SupervisedLoss(L2_factor=CFG.L2_factor, SAD_factor=CFG.SAD_factor, J=J, add_noise=add_noise)
     _, pe, best_permutation, _, _ = find_best_permutation_supervised(loss_function, torch.from_numpy(pe).unsqueeze(0).float().to(
                                                                         CFG.device),
@@ -103,28 +170,9 @@ def calculate_SPA_simplex(E0, pr2, J, add_noise=CFG.add_noise):
     pe = pe.cpu().numpy().squeeze(0)
     best_permutation = best_permutation[:J]
     ext0 = ext0[[best_permutation]]
-    # pe[:, :J] = pe[:, id0]
     return pe, id0, ext0
 
 
-
-def ensure_permutation(id0, J=CFG.Q):
-    unique_values, counts = np.unique(id0, return_counts=True)
-    duplicates = unique_values[counts > 1]  # Find duplicate elements
-
-    if len(duplicates) > 0:
-        all_possible_values = set(range(J))  # Set of all possible values
-        chosen_values = set(id0)  # Set of already chosen values
-        available_values = list(all_possible_values - chosen_values)  # Find available values
-
-        if available_values:  # Ensure we have available values to replace duplicates
-            for duplicate in duplicates:
-                indices = np.where(id0 == duplicate)[0]
-                for i in range(1, len(indices)):  # Start from the second occurrence
-                    if available_values:
-                        id0[indices[i]] = available_values.pop(0)  # Replace with available value
-
-    return id0
 
 def save_plots(t, f, Xt, Tmask):
     import matplotlib.pyplot as plt
@@ -185,10 +233,6 @@ def plot_P_speakers(speakers, plot_name, figs_directory, noise=None, title=None,
 def plot_results(P, pr2, pe, id0=None, J=CFG.Q, no_title=False, plot_flag=CFG.plot_flag, t=None, SISDRs=None, noise_P=None):
     if not plot_flag:
         return
-    # if id0 is not None and CFG.noise==1:
-    #     pe[:, :J] = pe[:, id0]
-    #
-    #     # P[:, :J] = P[:, id0]
 
     save_model_plots = False
     if no_title:
@@ -306,6 +350,25 @@ def plot_simplex(vectors, vertices_indexes, Q, seconds=20, SNR=20, figs_dir='fig
     plt.show()
 
 def find_top_active_indices(pe, P, P2, pr2, Ne=10, P_method=CFG.P_method, add_noise=CFG.add_noise):
+    """
+        Identifies the top Ne most active timeframes for each speaker (and optional noise)
+        based on different estimated probability matrices.
+
+        Args:
+            pe (np.ndarray): Probability matrix from SPA (L x (J + noise)).
+            P (np.ndarray): Probability matrix from the deep model (L x (J + noise)).
+            P2 (np.ndarray): Secondary probability matrix (used when P_method == 'both').
+            pr2 (np.ndarray): Ground truth probability matrix (L x (J + noise)).
+            Ne (int): Number of top timeframes to return per speaker.
+            P_method (str): Determines whether to also compute for P2.
+            add_noise (bool): Whether the matrices include a noise column.
+
+        Returns:
+            fh2 (list of np.ndarray): Top Ne indices per speaker from P.
+            fh22 (list of np.ndarray): Top Ne indices per speaker from P2 (only if P_method == 'both').
+            fh2_pe (list of np.ndarray): Top Ne indices per speaker from pe (SPA).
+            fh (list of np.ndarray): Top Ne indices per speaker from pr2 (ground truth).
+        """
     fh = []
     fh2 = []
     fh22 = []
@@ -328,7 +391,32 @@ def find_top_active_indices(pe, P, P2, pr2, Ne=10, P_method=CFG.P_method, add_no
 
 def local_mapping(pe, P, P2, pr2, Hlf, Xt, low_energy_mask, J, f, t, P_method, model_tested,
                   Tmask, add_noise=CFG.add_noise, plot_Emask=False):
+    """
+        Computes local masks for each time-frequency bin using a nearest-neighbor approach
+        based on cosine similarity in the feature space (Hlf). Applies to multiple methods.
 
+        Args:
+            pe (np.ndarray): SPA-estimated global probabilities (L x (J + noise)).
+            P (np.ndarray): Deep model estimated global probabilities (L x (J + noise)).
+            P2 (np.ndarray): Second deep model (used when P_method == 'both').
+            pr2 (np.ndarray): Ground truth probabilities (unused here).
+            Hlf (np.ndarray): Local features per frequency (F x L x D).
+            Xt (np.ndarray): Input STFT matrix (not used here).
+            low_energy_mask (np.ndarray): Boolean mask of low-energy timeframes.
+            J (int): Number of speakers.
+            f (np.ndarray): Frequency axis.
+            t (np.ndarray): Time axis.
+            P_method (str): One of 'vertices', 'prob', or 'both'.
+            model_tested (str): Name of the global model (for plotting).
+            Tmask (np.ndarray): Ground truth speaker mask.
+            add_noise (bool): Whether there's an added noise speaker.
+            plot_Emask (bool): Whether to plot the estimated masks.
+
+        Returns:
+            Emask (np.ndarray): Local mask (freq x time) for model P.
+            Emask2 (np.ndarray): Local mask for model P2 (if P_method == 'both').
+            Emask_pe (np.ndarray): Local mask for SPA model.
+        """
     print('Running Nearest Neighbour Local Mapping...')
 
 
@@ -339,9 +427,11 @@ def local_mapping(pe, P, P2, pr2, Hlf, Xt, low_energy_mask, J, f, t, P_method, m
     lenF0 = len(CFG.F0)
 
     for kk in range(CFG.NFFT // 2 + 1):
-
+        # Compute similarity matrix using gaussian kernel based on Euclidean distances with a  in feature space
         pdistEE = distance_matrix(Hlf[kk,:,:], Hlf[kk,:,:])
         p_dist_local = np.exp(-pdistEE)
+
+        # NN masks from the different models
 
         decide = np.dot(p_dist_local, P) / (np.tile(P.sum(axis=0) + 1e-12, (CFG.N_frames, 1)))
         idk = np.argmax(decide, axis=1)
@@ -355,7 +445,7 @@ def local_mapping(pe, P, P2, pr2, Hlf, Xt, low_energy_mask, J, f, t, P_method, m
         decide_pe = np.dot(p_dist_local, pe) / (np.tile(pe.sum(axis=0) + 1e-12, (CFG.N_frames, 1)))
         idk_pe = np.argmax(decide_pe, axis=1)
         Emask_pe[kk, :] = idk_pe
-
+    # Post-process to mask noise regions
     if CFG.add_noise == 1:
         Emask[low_energy_mask] = J
         Emask[:, P[:, J] > 0.85] = J
@@ -389,12 +479,38 @@ def local_mapping(pe, P, P2, pr2, Hlf, Xt, low_energy_mask, J, f, t, P_method, m
 
 def dist_scores(P, pr2, J, P_method):
 
-    # L2 = np.sum((pr2[:, :J] - P[:, :J]) ** 2)
     mse = mean_squared_error(pr2[:, :J], P[:, :J])
-
 
     return mse
 
+def MaskErr(Tmask, Emask, Q):
+    """
+        Compute Miss Detection (MD), False Alarm (FA), and Error rate of estimated masks.
+
+        Args:
+            Tmask (np.ndarray): Ground truth [F, T] mask.
+            Emask (np.ndarray): Estimated [F, T] mask.
+            Q (int): Number of speakers.
+
+        Returns:
+            Tuple: MD (float), FA (float), Err (float)
+    """
+    MDq = np.zeros(Q)
+    FAq = np.zeros(Q)
+
+
+    N_frames = Tmask.shape[1]
+    NFFT = Tmask.shape[0]
+    non_noise_num = np.sum(Tmask != Q)
+    for q in range(Q):
+        MDq[q] = np.sum(np.sum((Tmask == q) & (Emask != q))) / non_noise_num
+        FAq[q] = np.sum(np.sum((Tmask != q) & (Emask == q))) / non_noise_num
+
+    MD = np.mean(MDq)
+    FA = np.mean(FAq)
+    Acc = np.sum((Tmask == Emask) & (Tmask != Q) & (Emask != Q)) / non_noise_num
+    Err = 1 - Acc
+    return MD, FA, Err
 
 def si_sdr(s, s_hat):
     alpha = np.sum(s_hat * s, axis=0) / np.linalg.norm(s, axis=0)**2
@@ -418,22 +534,43 @@ def compute_true_RTFs_from_Xq(Xq):
 def audio_scores(pr2, P, Tmask, Emask,
                  Hl, Xt, Hq, Xq, xqf, fh2, fh, J=CFG.Q, compute_ideal=False,
                  P_method=CFG.P_method, local_method='NN', print_scores=True):
+    """
+        Computes separation quality metrics (MSE (L2), SDR, SI-SDR, PESQ, STOI, MaskErr, MD, FA)
+        for a given global estimate P and corresponding local mask Emask.
+
+        Args:
+            pr2 (np.ndarray): Ground truth global probability matrix.
+            P (np.ndarray): Estimated global probability matrix.
+            Tmask (np.ndarray): Ground truth local time-frequency mask.
+            Emask (np.ndarray): Estimated local mask.
+            Hl, Xt, Hq, Xq, xqf: Input features, STFTs, and signals.
+            fh2 (list): Indices of top frames by P.
+            fh (list): Indices of top frames by ground truth.
+            J (int): Number of speakers.
+            compute_ideal (bool): Whether to compute ideal performance for reference.
+            P_method (str): Global method used ('vertices' / 'prob').
+            local_method (str): Local method used ('NN' / 'SpatialNet').
+            print_scores (bool): Whether to print metrics.
+
+        Returns:
+            dict: Metrics computed for the method.
+        """
+
     key_suffix = P_method + '_' + local_method
     olap, lens, att, fs = CFG.olap, CFG.lens, CFG.att, CFG.old_fs
-    SDRi, sisdri, yi = None, None, None
-    SDRii, sisdrii, yii = None, None, None
-    u_GT = np.nan_to_num(np.asarray(xqf[:, 0, :].real, dtype=np.float32))
 
+    u_GT = np.nan_to_num(np.asarray(xqf[:, 0, :].real, dtype=np.float32))
     L2 = dist_scores(P, pr2, J, P_method)
     print(f'L2({P_method}, real): {L2:.4f}')
-    # Compute SDRii, sisdrii, yii, SDRi, sisdri, yi if compute_ideal is True
+
+    # Compute ideal mask-based beamforming separation if requested
+    SDRi, sisdri, yi = None, None, None
     if compute_ideal:
         # H_gt = compute_true_RTFs_from_Xq(Xq)
         # Compute ideal
-        SDRi, sisdri, yi = beamformer_nonoise(Xt, Tmask, xqf, J, fh, olap, lens, 0.0001, 1, CFG.fs, CFG.att,
+        SDRi, sisdri, yi = beamformer(Xt, Tmask, xqf, J, fh, olap, lens, 0.0001, 1, CFG.fs, CFG.att,
                                               Hq = None)
-        # SDRii, sisdrii, yii = beamformer_nonoise(Xt, None, xqf, J, fh2, olap, lens, 0.0001, 0, CFG.fs, CFG.att, Xq, Hq, Hl)
-
+        # === Optional AuxIVA baseline ===
         # try:
         #     SDR_aux, sisdr_aux, stoi_aux, pesq_aux = calc_auxip(Xt, xqf[:, 0, :], J=J)
         # except Exception as e:
@@ -452,22 +589,12 @@ def audio_scores(pr2, P, Tmask, Emask,
             # print(f'AuxIVA-IP SI-SDR: {sisdr_aux}')
 
 
-    # Select C_P based on beamforming type
-    C_P = None
-    if CFG.beamformer_type[-1] == 'C':
-        calib = np.load('calib.npz')
-        if P_method == 'vertices':
-            C_suffix = ''
-        else:
-            C_suffix = key_suffix
-        lhat_P = calib[f'lhats_{C_suffix}'][1]
-        C_P = P > lhat_P
 
     # Compute MD and FA
     MD, FA, Err = MaskErr(Tmask, Emask, J)
 
     # Compute SDR, sisdr, ym
-    SDR, sisdr, ym = beamformer_nonoise(Xt, Emask, xqf, J, fh2, olap, lens, 0.01, 1, CFG.fs, CFG.att, C=C_P)
+    SDR, sisdr, ym = beamformer(Xt, Emask, xqf, J, fh2, olap, lens, 0.01, 1, CFG.fs, CFG.att, C=C_P)
 
     # Compute STOI and PESQ
     um = np.nan_to_num(np.asarray(ym.real, dtype=np.float32))
@@ -506,6 +633,23 @@ def audio_scores(pr2, P, Tmask, Emask,
 
 
 def calc_needed_audio_scores(dict_list, pr2, fh, Tmask, Hl, Xt, Hq, Xq, xqf, J=CFG.Q, show_best_local=True, show_best_global=True, print_scores=True):
+    """
+        Runs audio evaluation (SDR, PESQ, STOI, etc.) for a list of (P, mask) configurations.
+
+        Args:
+            dict_list (list): Each item includes 'P', 'local_mask', 'P_method', 'local_method', 'fh2'.
+            pr2 (np.ndarray): Ground-truth global probability matrix.
+            fh (list): Top-frame indices by ground truth (for beamforming).
+            Tmask (np.ndarray): Ground-truth TF mask.
+            Hl, Xt, Hq, Xq, xqf: Input features and signals.
+            J (int): Number of sources.
+            show_best_local (bool): Also compute best result between deep local methods.
+            show_best_global (bool): Also compute best result between global NN methods.
+            print_scores (bool): Print metric values.
+
+        Returns:
+            dict: All computed metric values, including best-of summaries.
+    """
     results = {}
     first_run = True
     metrics = ["L2_P", "Err", "MD", "FA", "SDR", "si-sdr", "stoi", "pesq"]
@@ -514,9 +658,9 @@ def calc_needed_audio_scores(dict_list, pr2, fh, Tmask, Hl, Xt, Hq, Xq, xqf, J=C
         P_method, local_method = d['P_method'], d['local_method']
 
         scores = audio_scores(
-            pr2=pr2,  # Assuming pr2 is not needed for this function
+            pr2=pr2,
             P=P, J=J,
-            Tmask=Tmask,  # Assuming Tmask is handled inside audio_scores
+            Tmask=Tmask,
             Emask=local_mask,
             Hl=Hl, Xt=Xt, Hq=Hq, Xq=Xq, xqf=xqf, fh2=fh2, fh=fh,
             compute_ideal=first_run,  # Compute ideal only for the first run
@@ -603,29 +747,6 @@ def plot_metrics(train_losses, train_rmses, train_sads, val_losses, val_rmses, v
     plt.tight_layout()
     plt.show()
 
-def cosine_sim1(P):
-    b, L, cols = P.size()
-
-    cos_sims = []
-    col_indices = list(range(cols))
-    permutations = list(itertools.permutations(col_indices))
-
-    for perm in permutations:
-        P_permuted = P[:, :, perm]
-
-        P_permuted_reshaped = P_permuted.view(b * cols, L, 1)
-
-        P_reshaped = P_permuted.view(b * cols, L, 1)
-        P_norm = torch.sqrt(torch.bmm(P_reshaped.transpose(1, 2), P_reshaped).view(b, cols, 1))
-
-        permuted_norm  = torch.sqrt(torch.bmm(P_permuted_reshaped.transpose(1, 2), P_permuted_reshaped).view(b, cols, 1))
-
-        summation = torch.bmm(P_reshaped.transpose(1, 2), P_permuted_reshaped).view(b, cols, 1)
-        cos_sim = summation / (P_norm * permuted_norm)
-        cos_sims.append(cos_sim.mean())
-
-    return sum(cos_sims)
-
 
 def cosine_sim(P):
     b, L, cols = P.size()
@@ -646,7 +767,6 @@ def cosine_sim(P):
     cos_sim_avg = cos_sim_sum / num_pairs
 
     return cos_sim_avg.mean()
-
 
 
 
@@ -770,36 +890,6 @@ def plot_masks(Tmask, deep_mask, Emask=None, P_method=CFG.P_method):
 
     plt.subplots_adjust(right=0.85)  # Adjust space to fit the colorbar
     plt.show()
-#
-def calc_ilrma(Xt, y, J=CFG.Q, NFFT=CFG.NFFT, olap=CFG.olap, fs=CFG.fs):
-    Y_stft = ilrma(Xt[:,:,:J], n_iter=100, n_src=y.shape[-1])
-    ym = np.zeros_like(y)
-    for q in range(J):
-
-        ym[:, q] = signal.istft(Y_stft[:, :, q], nperseg=CFG.NFFT, noverlap=olap * NFFT, nfft=NFFT, fs=fs)[1][:ym[:, q].shape[0]]
-
-
-    # Convert to Torch tensors
-    y_torch = torch.from_numpy(np.real(y)).T  # (J, time)
-    ym_torch = torch.from_numpy(np.real(ym)).T  # (J, time)
-
-    permutations = list(itertools.permutations(range(J)))
-
-    max_sisdr = float('-inf')
-    for perm in permutations:
-        perm_speakers_ym = ym_torch[perm, :]
-        sisdr = t_audio_SI_SDR(perm_speakers_ym, y_torch).mean().item()
-
-        if sisdr > max_sisdr:
-            max_sisdr = sisdr
-            best_y = perm_speakers_ym
-
-    SDR = t_audio_SDR(best_y, y_torch).mean().item()
-    ui = np.nan_to_num(best_y.numpy().T)
-    um = np.nan_to_num(y_torch.numpy().T)
-    st = np.mean([stoi(ui[:, j], um[:, j], fs) for j in range(J)])
-    pesq = calc_psq(ui, um)
-    return SDR, max_sisdr, st, pesq
 
 def calc_auxip(Xt, y, J=CFG.Q, NFFT=CFG.NFFT, olap=CFG.olap, fs=CFG.fs):
     aux = torchiva.AuxIVA_IP(n_iter=30, n_src=y.shape[-1])
@@ -834,64 +924,31 @@ def calc_auxip(Xt, y, J=CFG.Q, NFFT=CFG.NFFT, olap=CFG.olap, fs=CFG.fs):
     pesq = calc_psq(ui, um)
     return SDR, max_sisdr, st, pesq
 
-def calc_auxip2(Xt, y, J=CFG.Q, NFFT=CFG.NFFT, olap=CFG.olap, fs=CFG.fs):
-    aux = torchiva.AuxIVA_IP2(n_iter=30)
-    Xt = Xt.transpose(2, 0, 1)
-
-    Y_stft = aux(torch.from_numpy(Xt[:J,:,:]))
-    Y_stft = Y_stft.permute(1, 2, 0)
-    ym = np.zeros_like(y)
-    for q in range(J):
-        Y_stft[:, :, q]
-        ym[:, q] = signal.istft(Y_stft[:, :, q], nperseg=CFG.NFFT, noverlap=olap * NFFT, nfft=NFFT, fs=fs)[1][:ym[:, q].shape[0]]
-
-
-    # Convert to Torch tensors
-    y_torch = torch.from_numpy(np.real(y)).T  # (J, time)
-    ym_torch = torch.from_numpy(np.real(ym)).T  # (J, time)
-
-    permutations = list(itertools.permutations(range(J)))
-
-    max_sisdr = float('-inf')
-    for perm in permutations:
-        perm_speakers_ym = ym_torch[perm, :]
-        sisdr = t_audio_SI_SDR(perm_speakers_ym, y_torch).mean().item()
-
-        if sisdr > max_sisdr:
-            max_sisdr = sisdr
-            best_y = perm_speakers_ym
-
-    SDR = t_audio_SDR(best_y, y_torch).mean().item()
-    ui = np.nan_to_num(best_y.numpy().T)
-    um = np.nan_to_num(y_torch.numpy().T)
-    st = np.mean([stoi(ui[:, j], um[:, j], fs) for j in range(J)])
-    pesq = calc_psq(ui, um)
-    return SDR, max_sisdr, st, pesq
-
-if __name__ == '__main__':
-    pe_complete = np.load('experiments_results/pe_complete.npy')
-    pr2_complete = np.load('experiments_results/pr2_complete.npy')
-    P2_complete = np.load('experiments_results/P2_complete.npy')
-    E0_complete = np.load('experiments_results/E0_complete.npy')
-    ext0_complete = np.load('experiments_results/ext0_complete.npy')
-    t = np.load('experiments_results/t.npy')
-    pe_incomplete = np.load('experiments_results/pe_incomplete.npy')
-    pr2_incomplete = np.load('experiments_results/pr2_incomplete.npy')
-    P2_incomplete = np.load('experiments_results/P2_incomplete.npy')
-    E0_incomplete = np.load('experiments_results/E0_incomplete.npy')
-    ext0_incomplete = np.load('experiments_results/ext0_incomplete.npy')
-    J=3
-    plot3d_simplex(E0_incomplete[:, :J], ext0_incomplete[0], title='', vector_type='u',
-                   elev=30, azim=140)
-    j = 0
-    plot_name = f'speaker{j+1}_methods_comparison'
-    plt.plot(t[0:62], P2_incomplete[200:262, j], color='blue', label='Deep Method')
-    plt.plot(t[0:62], pr2_incomplete[200:262, j], color='red', label='Ideal Method')
-    plt.plot(t[0:62], pe_incomplete[200:262, j], color='green', label='Standard Method')
-    plt.xlabel('Time [s]', fontsize=15)
-    plt.ylabel('Global Probabilities', fontsize=15)
-    plt.xticks(fontsize=15)
-    plt.yticks(fontsize=15)
-    plt.legend()
-    plt.savefig(f'experiments_results/{plot_name}.png', dpi=300, bbox_inches='tight', pad_inches=0.3)
-    plt.show()
+#
+# if __name__ == '__main__':
+#     pe_complete = np.load('experiments_results/pe_complete.npy')
+#     pr2_complete = np.load('experiments_results/pr2_complete.npy')
+#     P2_complete = np.load('experiments_results/P2_complete.npy')
+#     E0_complete = np.load('experiments_results/E0_complete.npy')
+#     ext0_complete = np.load('experiments_results/ext0_complete.npy')
+#     t = np.load('experiments_results/t.npy')
+#     pe_incomplete = np.load('experiments_results/pe_incomplete.npy')
+#     pr2_incomplete = np.load('experiments_results/pr2_incomplete.npy')
+#     P2_incomplete = np.load('experiments_results/P2_incomplete.npy')
+#     E0_incomplete = np.load('experiments_results/E0_incomplete.npy')
+#     ext0_incomplete = np.load('experiments_results/ext0_incomplete.npy')
+#     J=3
+#     plot3d_simplex(E0_incomplete[:, :J], ext0_incomplete[0], title='', vector_type='u',
+#                    elev=30, azim=140)
+#     j = 0
+#     plot_name = f'speaker{j+1}_methods_comparison'
+#     plt.plot(t[0:62], P2_incomplete[200:262, j], color='blue', label='Deep Method')
+#     plt.plot(t[0:62], pr2_incomplete[200:262, j], color='red', label='Ideal Method')
+#     plt.plot(t[0:62], pe_incomplete[200:262, j], color='green', label='Standard Method')
+#     plt.xlabel('Time [s]', fontsize=15)
+#     plt.ylabel('Global Probabilities', fontsize=15)
+#     plt.xticks(fontsize=15)
+#     plt.yticks(fontsize=15)
+#     plt.legend()
+#     plt.savefig(f'experiments_results/{plot_name}.png', dpi=300, bbox_inches='tight', pad_inches=0.3)
+#     plt.show()

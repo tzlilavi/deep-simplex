@@ -1,33 +1,36 @@
+import os
+import pickle
+import random
+import time
+
+import joblib
 import numpy as np
 import scipy.signal as ss
 import soundfile as sf
-import rir_generator as rir
-import os
-import CFG
-from torch.utils.data import Dataset, DataLoader, Subset
-import torch
-import random
-import joblib
-
-from functions import feature_extraction, calculate_W_U_realSimplex, calculate_SPA_simplex, calc_ilrma, calc_auxip
-from scipy.signal import decimate, stft, get_window, resample
-from scipy.io import wavfile
-import rir_generator as rir
-import scipy.signal as ss
-import CFG  # Importing the configuration file
+from scipy.signal import resample, stft
 from tqdm import tqdm
-import pickle
-import time
 
-import matplotlib.pyplot as plt
+import CFG
+import rir_generator as rir
+from functions import feature_extraction, calculate_W_U_realSimplex, calculate_SPA_simplex, calc_auxip
+
 np.random.seed(CFG.seed0)
 random.seed(CFG.seed0)
 
 
 def concatenate_flac_with_gaps(input_directory, sample_rate=CFG.fs, max_duration=30, delay_max=5, delay_min=3):
     """
-    Concatenates speaker's signals one after another until reaching max_duration.
-    Then, randomly inserts silent gaps of size [0, delay_max] at random positions.
+    Concatenate .flac audio files from a directory into a single signal with optional silent gaps.
+
+    Args:
+        input_directory (str): Path to speaker folder containing .flac files.
+        sample_rate (int): Target sample rate (default: CFG.fs).
+        max_duration (int): Max total duration (in seconds) of output signal.
+        delay_max (int): Maximum silent gap between utterances (in seconds).
+        delay_min (int): Minimum silent gap between utterances (in seconds).
+
+    Returns:
+        np.ndarray: Normalized concatenated waveform with inserted silence.
     """
     concatenated_signal = np.array([])
     max_samples = max_duration * sample_rate
@@ -44,8 +47,6 @@ def concatenate_flac_with_gaps(input_directory, sample_rate=CFG.fs, max_duration
         if sr != sample_rate:
             raise ValueError(f"Sample rate mismatch: {flac_file} has {sr} Hz, expected {sample_rate} Hz.")
 
-        # Concatenate directly without delay first
-        concatenated_signal = np.concatenate((concatenated_signal, signal)) if concatenated_signal.size else signal
 
         delay_length = random.randint(delay_min * sample_rate, delay_max * sample_rate)
         delay_signal = np.zeros(delay_length)
@@ -66,8 +67,89 @@ def concatenate_flac_with_gaps(input_directory, sample_rate=CFG.fs, max_duration
     return concatenated_signal
 
 
+def apply_silence_2_speakers(xqf, overlap_demand=0.5, num_silences=3, sample_rate=16000):
+    """
+        Introduce controlled silence into a 2-speaker mixture to match a target overlap ratio.
+
+        Args:
+            xqf (np.ndarray): [T, C, 2] time-domain mixture for 2 speakers.
+            overlap_demand (float): Desired overlap ratio (0 to 1).
+            num_silences (int): Number of silent segments to insert.
+            sample_rate (int): Not used, included for compatibility.
+
+        Returns:
+            np.ndarray: Modified signal with inserted silent segments.
+        """
+    y = xqf.copy()
+    lens = xqf.shape[0]
+
+    silence_ratio = 1 - overlap_demand
+    total_silence_samples_per_speaker = int(silence_ratio * lens)
+
+    # Generate `num_silences` random silence segments that sum to total silence
+    silence_lens = np.random.randint(
+        1, total_silence_samples_per_speaker // num_silences + 1, size=num_silences
+    )
+
+    # Adjust to ensure the total silence per speaker is exactly correct
+    silence_lens = silence_lens / silence_lens.sum() * total_silence_samples_per_speaker
+    silence_lens = silence_lens.astype(int)
+
+    # Ensure silences are evenly spread by picking random start positions
+    start_positions = sorted(random.sample(range(lens - max(silence_lens)), num_silences))
+
+    for i in range(num_silences):
+        silent_speaker = random.choice([0, 1])  # Randomly pick which speaker goes silent
+        start = start_positions[i]
+        end = min(start + silence_lens[i], lens)  # Ensure we stay in bounds
+
+        # Apply silence to the selected speaker
+        y[start:end, :, silent_speaker] = 0
+
+    return y
+
+def calc_speaker_ratio(xqf, J=CFG.Q, TH=1e-5):
+    """
+    Calculate the proportion of time frames where all speakers are active.
+
+    Args:
+        xqf (np.ndarray): [T, C, Q] time-domain signal for Q sources.
+        J (int): Number of speakers.
+        TH (float): Energy threshold to define activity.
+
+    Returns:
+        float: Ratio of overlapping frames among active frames.
+    """
+    energy = np.sum(np.abs(xqf), axis=1)
+    active_speakers = energy > TH  # Binary mask (lens, Q)
+
+    one_or_more_speakers = np.sum(active_speakers, axis=1) >= 1
+    active_frame_count = np.sum(one_or_more_speakers)
+
+    overlapping_count = np.sum(active_speakers, axis=1) == J
+    overlap_ratio = np.sum(overlapping_count) / active_frame_count if active_frame_count > 0 else 0
+
+    return overlap_ratio
+
+
 def save_train_val_wav_signals(input_directory='dev-clean-test', output_base_directory='dev-wav-new-5', train_size=0.8,
                                sample_rate=16000, max_duration=30, delay_max=5, delay_min=3, num_gaps=5):
+    """
+        Generate training and validation WAV files by concatenating .flac utterances with silence gaps.
+
+        Args:
+            input_directory (str): Path to raw LibriSpeech speaker folders.
+            output_base_directory (str): Output root for 'train' and 'val' folders.
+            train_size (float): Ratio of speakers to assign to training.
+            sample_rate (int): Target sample rate.
+            max_duration (int): Max length (seconds) of each WAV file.
+            delay_max (int): Max silence between utterances (seconds).
+            delay_min (int): Min silence between utterances (seconds).
+            num_gaps (int): Unused. Included for compatibility/future control.
+
+        Outputs:
+            Saves .wav files to train/ and val/ folders under output_base_directory.
+        """
     random.seed(CFG.seed0)
     train_directory = os.path.join(output_base_directory, 'train')
     val_directory = os.path.join(output_base_directory, 'val')
@@ -98,31 +180,48 @@ def save_train_val_wav_signals(input_directory='dev-clean-test', output_base_dir
         print(f"Saved concatenated audio for speaker {speaker_dir} to {output_wav_path}")
     print('Finished creating new WAV datafiles')
 
-
-
-
 def generate_random_angle(used_angles, min_angle_difference=30):
-    """Generate a random angle that is at least `min_angle_difference` from all used angles."""
+    """
+    Generate a random angle [0, 360) that differs by at least `min_angle_difference`
+    from all angles in `used_angles`.
+    """
     while True:
         angle = np.random.uniform(0, 360)
         if all(abs((angle - a + 180) % 360 - 180) >= min_angle_difference for a in used_angles):
             return angle
+
 def generate_RIRs(room_length, room_width, mic_spacing, num_mics, min_angle_difference, radius,
                   num_of_RIRs, rev, angles=None):
+    """
+        Generate Room Impulse Responses (RIRs) for `num_of_RIRs` sources placed around a microphone array.
 
+        Args:
+            room_length (float): Length of room (in meters).
+            room_width (float): Width of room (in meters).
+            mic_spacing (float): Spacing between microphones (in meters).
+            num_mics (int): Number of microphones.
+            min_angle_difference (float): Minimum angular separation between sources.
+            radius (float): Distance of sources from array center.
+            num_of_RIRs (int): Number of source RIRs to generate.
+            rev (float): Reverberation time (RT60 in seconds).
+            angles (list or None): Optional fixed source angles in degrees.
+
+        Returns:
+            tuple: (List of RIRs, list of used angles in degrees)
+        """
     middle_x = room_length / 2
     middle_y = room_width / 2
     mics = [[middle_x - (num_mics // 2 - i) * mic_spacing, middle_y, 1] for i in range(num_mics)]
     RIRs = []
     used_angles = []
-    thetas = [1, 2, 3]
     for i in range(num_of_RIRs):
         if angles is None:
             angle = generate_random_angle(used_angles, min_angle_difference)
         else: angle = angles[i]
+
         theta = np.deg2rad(angle)
-        # theta = thetas[i]
-        used_angles.append(np.rad2deg(theta))
+        used_angles.append(angle)
+
         source_x = middle_x + radius * np.cos(theta)
         source_y = middle_y + radius * np.sin(theta)
         source_position = [source_x, source_y, 1]
@@ -139,48 +238,20 @@ def generate_RIRs(room_length, room_width, mic_spacing, num_mics, min_angle_diff
 
     return RIRs, used_angles
 
-def calc_speaker_ratio(xqf, J=CFG.Q, TH=1e-5, lens=CFG.lens):
-    energy = np.sum(np.abs(xqf), axis=1)
-    active_speakers = energy > TH  # Binary mask (lens, Q)
 
-    one_or_more_speakers = np.sum(active_speakers, axis=1) >= 1
-    active_frame_count = np.sum(one_or_more_speakers)
-
-    overlapping_count = np.sum(active_speakers, axis=1) == J
-    overlap_ratio = np.sum(overlapping_count) / active_frame_count if active_frame_count > 0 else 0
-
-    return overlap_ratio
-
-def apply_silence_2_speakers(xqf, overlap_demand=0.5, num_silences=3, sample_rate=16000):
-    y = xqf.copy()
-    lens = xqf.shape[0]
-
-    silence_ratio = 1 - overlap_demand
-    total_silence_samples_per_speaker = int(silence_ratio * lens)
-
-    # Generate `num_silences` random silence segments that sum to total silence
-    silence_lens = np.random.randint(
-        1, total_silence_samples_per_speaker // num_silences + 1, size=num_silences
-    )
-
-    # Adjust to ensure the total silence per speaker is exactly correct
-    silence_lens = silence_lens / silence_lens.sum() * total_silence_samples_per_speaker
-    silence_lens = silence_lens.astype(int)
-
-    # Ensure silences are evenly spread by picking random start positions
-    start_positions = sorted(random.sample(range(lens - max(silence_lens)), num_silences))
-
-    for i in range(num_silences):
-        silent_speaker = random.choice([0, 1])  # Randomly pick which speaker goes silent
-        start = start_positions[i]
-        end = min(start + silence_lens[i], lens)  # Ensure we stay in bounds
-
-        # Apply silence to the selected speaker
-        xqf[start:end, :, silent_speaker] = 0
-
-    return xqf
 
 def add_noise_to_signal(signal, noise, SNR):
+    """
+        Add scaled noise to a signal to achieve a specified SNR.
+
+        Args:
+            signal (np.ndarray): Clean signal [T] or [T, C].
+            noise (np.ndarray): Noise signal (same shape or [T]).
+            SNR (float): Desired signal-to-noise ratio in dB.
+
+        Returns:
+            np.ndarray: Noisy signal with specified SNR.
+        """
     min_length = min(signal.shape[0], noise.shape[0])
     signal = signal[:min_length]
     noise = noise[:min_length]
@@ -196,49 +267,49 @@ def add_noise_to_signal(signal, noise, SNR):
     return signal + noise_scaling * noise
 
 def combine_speaker_signals(speakers_signals, RIRs, num_mics, J=2, overlap_demand=None,
-                            add_noise=CFG.add_noise, SNR=CFG.SNR,
-                            pad=CFG.pad_flag, pad_size=CFG.pad_size, pad_tfs=CFG.pad_tfs):
+                            add_noise=CFG.add_noise, SNR=CFG.SNR):
+    """
+       Simulate multichannel mixture by convolving source signals with RIRs,
+       adding noise (optional), and computing STFTs.
 
+       Args:
+           speakers_signals (list): List of raw waveforms, one per speaker.
+           RIRs (list): List of RIRs, one per speaker.
+           num_mics (int): Number of microphones.
+           J (int): Number of speakers.
+           overlap_demand (float): Target overlap ratio (used for 2-speaker mixtures).
+           add_noise (bool): Whether to add white noise.
+           SNR (float): Signal-to-noise ratio (if noise is added).
+
+       Returns:
+           tuple: Xt, Tmask, f, t, xqf, Xq, overlap_ratio, low_energy_mask, low_energy_mask_time, x
+       """
     lens = CFG.lens
     # Initialize the filtered signal array
     xqf = np.zeros((lens, num_mics, J))
 
 
     # Convolve each speaker's signal with the RIR
-    # sampled_RIRs = random.sample(RIRs, J)
-    sampled_RIRs = RIRs
     for q, signal in enumerate(speakers_signals):
-        h = sampled_RIRs[q]
+        h = RIRs[q]
         convolved_signal = np.zeros((CFG.lens, num_mics))  # Placeholder for convolved signal
 
         # Convolve with the RIR for each microphone
         for m in range(num_mics):
             # Apply convolution per microphone, ensuring 'same' mode to keep length
             convolved_signal[:, m] = ss.convolve(signal.squeeze(), h[:, m], mode='same')
-
-        # Apply high-pass filter for each microphone
+            # Apply high-pass filter for each microphone
             xqf[:, m, q] = ss.filtfilt(CFG.highpass, 1, convolved_signal[:, m])
-
-
-
-
 
 
     if overlap_demand is not None and J==2:
         xqf = apply_silence_2_speakers(xqf, overlap_demand, num_silences=4)
     overlap_ratio = calc_speaker_ratio(xqf, J, TH=1e-5)
-    # Sum the filtered signals across speakers
+    # Sum the filtered signals across speakers for the seen mixture
     x = np.sum(xqf, axis=2)
-
-    # if pad and pad_size > 0:
-    #     # ys_copy = np.pad(ys_copy, ((pad_size, pad_size), (0, 0), (0, 0)), mode='constant')
-    #     x = np.pad(x, ((pad_size, pad_size), (0, 0)), mode='constant')
 
     # Perform STFT on the filtered signals
     Xq = np.empty((CFG.NFFT // 2 + 1, CFG.N_frames, CFG.M, J), dtype=complex)
-
-
-
     noise = np.random.normal(size=(x.shape))
     N = np.empty((CFG.NFFT // 2 + 1, CFG.N_frames, CFG.M), dtype=complex)
 
@@ -264,10 +335,7 @@ def combine_speaker_signals(speakers_signals, RIRs, num_mics, J=2, overlap_deman
 
     # Xq *= CFG.stft_scaling
     # Xt *= CFG.stft_scaling
-    # Xq += 1e-8
-    # Xt += 1e-8
     # Time-frequency mask to detect strongest source
-
     if J==3:
         TH = -150
     elif J==2:
@@ -348,6 +416,18 @@ def get_speaker_signals(dataset_path, previous_combinations=None, J=CFG.Q, speak
     return speaker_signals, previous_combinations, selected_speakers
 
 def create_mixes_data_file(num_samples, input_directory='dev-wav-full', train_val_path='train', J=CFG.Q):
+    """
+        Simulate mixtures for training or validation and save W and P matrices to a joblib file.
+
+        Args:
+            num_samples (int): Number of mixture examples to generate.
+            input_directory (str): Base folder with speaker WAVs.
+            train_val_path (str): Subfolder name ('train' or 'val').
+            J (int): Number of speakers per mixture.
+
+        Output:
+            Saves a joblib file with 'Ws' and 'Ps' lists of size `num_samples`.
+        """
     dataset_path = os.path.join(input_directory, train_val_path)
     L = CFG.N_frames
     K = CFG.H_freqbands
@@ -376,8 +456,6 @@ def create_mixes_data_file(num_samples, input_directory='dev-wav-full', train_va
 
     time_elapsed = time.time() - start
     print(f"Created data file with {num_samples} samples, in {time_elapsed} seconds")
-
-
 # create_data_file(2400, train_val_path='train')
 # create_data_file(600, train_val_path='val')
 
@@ -473,29 +551,29 @@ def extract_wsj0_features(mixed_signal, ys, num_mics, J=CFG.Q, pad=CFG.pad_flag)
     return Xt, Tmask, f, t, ys, Xq, overlap_ratio, low_energy_mask, low_energy_mask_time, mixed_signal
 
 
-if __name__ == "__main__":
-    np.random.seed(CFG.seed0)
-    random.seed(CFG.seed0)
-    # save_train_val_wav_signals(input_directory='dev-clean-test', output_base_directory='dev-wav-8-4', train_size=0.8,
-    #                            sample_rate=16000,
-    #                            max_duration=20, delay_max=5, delay_min=3, num_gaps=3)
-
-    previous_combinations = None
-    J = 3
-    # overlap_ratios = 0
-    num_test_runs = 30
-    for i in tqdm(range(num_test_runs)):
-        signals, previous_combinations, speakers = get_speaker_signals('dev-wav-0/train', previous_combinations, J)
-        RIRs, angles = generate_RIRs(room_length=6, room_width=6, mic_spacing=0.3, num_mics=6, min_angle_difference=30,
-                                     radius=2,
-                                     num_of_RIRs=J, rev=CFG.low_rev)
-        combined_data = combine_speaker_signals(signals, RIRs, num_mics=CFG.M, J=J, overlap_demand=None)
-        Xt, Tmask, f, t, xqf, Xq, overlap_ratio, low_energy_mask, low_energy_mask_time, x = combined_data
-        plt.plot(xqf[:,0,:])
-        plt.show()
-        print(f'Speakers: {speakers}')
-        print(f'Sources angles relative to room center: {[int(angle) for angle in angles]}')
-        print(f'{J} overlap ratio: {overlap_ratio}')
-
+# if __name__ == "__main__":
+#     np.random.seed(CFG.seed0)
+#     random.seed(CFG.seed0)
+#     # save_train_val_wav_signals(input_directory='dev-clean-test', output_base_directory='dev-wav-8-4', train_size=0.8,
+#     #                            sample_rate=16000,
+#     #                            max_duration=20, delay_max=5, delay_min=3, num_gaps=3)
+#
+#     previous_combinations = None
+#     J = 3
+#     # overlap_ratios = 0
+#     num_test_runs = 30
+#     for i in tqdm(range(num_test_runs)):
+#         signals, previous_combinations, speakers = get_speaker_signals('dev-wav-0/train', previous_combinations, J)
+#         RIRs, angles = generate_RIRs(room_length=6, room_width=6, mic_spacing=0.3, num_mics=6, min_angle_difference=30,
+#                                      radius=2,
+#                                      num_of_RIRs=J, rev=CFG.low_rev)
+#         combined_data = combine_speaker_signals(signals, RIRs, num_mics=CFG.M, J=J, overlap_demand=None)
+#         Xt, Tmask, f, t, xqf, Xq, overlap_ratio, low_energy_mask, low_energy_mask_time, x = combined_data
+#         plt.plot(xqf[:,0,:])
+#         plt.show()
+#         print(f'Speakers: {speakers}')
+#         print(f'Sources angles relative to room center: {[int(angle) for angle in angles]}')
+#         print(f'{J} overlap ratio: {overlap_ratio}')
+#
 
 
