@@ -551,29 +551,14 @@ def extract_wsj0_features(mixed_signal, ys, num_mics, J=CFG.Q, pad=CFG.pad_flag)
     return Xt, Tmask, f, t, ys, Xq, overlap_ratio, low_energy_mask, low_energy_mask_time, mixed_signal
 
 
-# if __name__ == "__main__":
-#     np.random.seed(CFG.seed0)
-#     random.seed(CFG.seed0)
-#     # save_train_val_wav_signals(input_directory='dev-clean-test', output_base_directory='dev-wav-8-4', train_size=0.8,
-#     #                            sample_rate=16000,
-#     #                            max_duration=20, delay_max=5, delay_min=3, num_gaps=3)
-#
-#     previous_combinations = None
-#     J = 3
-#     # overlap_ratios = 0
-#     num_test_runs = 30
-#     for i in tqdm(range(num_test_runs)):
-#         signals, previous_combinations, speakers = get_speaker_signals('dev-wav-0/train', previous_combinations, J)
-#         RIRs, angles = generate_RIRs(room_length=6, room_width=6, mic_spacing=0.3, num_mics=6, min_angle_difference=30,
-#                                      radius=2,
-#                                      num_of_RIRs=J, rev=CFG.low_rev)
-#         combined_data = combine_speaker_signals(signals, RIRs, num_mics=CFG.M, J=J, overlap_demand=None)
-#         Xt, Tmask, f, t, xqf, Xq, overlap_ratio, low_energy_mask, low_energy_mask_time, x = combined_data
-#         plt.plot(xqf[:,0,:])
-#         plt.show()
-#         print(f'Speakers: {speakers}')
-#         print(f'Sources angles relative to room center: {[int(angle) for angle in angles]}')
-#         print(f'{J} overlap ratio: {overlap_ratio}')
-#
+if __name__ == "__main__":
+    np.random.seed(CFG.seed0)
+    random.seed(CFG.seed0)
+    save_train_val_wav_signals(input_directory='dev-clean-test', output_base_directory='dev-wav-5-3', train_size=0.8,
+                               sample_rate=16000,
+                               max_duration=20, delay_max=5, delay_min=3, num_gaps=3)
+
+
+
 
 

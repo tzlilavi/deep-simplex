@@ -20,7 +20,7 @@ from functions import (
     plot_heat_mat, plot_results, plot_simplex
 )
 
-from unsupervised import deep_local_masking, global_method
+from unsupervised import global_method
 
 
 random.seed(CFG.seed0)
@@ -190,35 +190,7 @@ def run_pipeline(
     )
 
 
-    # --- Run deep local masking if enabled ---
-    deep_mask_hard = None
-    deep_mask_hard2 = None
 
-    if use_local_deep:
-        if P_method == 'both':
-            deep_dict_local, _, deep_mask_hard = deep_local_masking(
-                Xt, P, Hlf, Tmask, Emask=Emask, P_method='vertices', plot_mask=True
-            )
-            deep_dict_local2, _, deep_mask_hard2 = deep_local_masking(
-                Xt, P2, Hlf, Tmask, Emask=Emask2, P_method='prob', plot_mask=True
-            )
-        else:
-            deep_dict_local, _, deep_mask_hard = deep_local_masking(
-                Xt, P, Hlf, Tmask, Emask=Emask, P_method=P_method,
-                plot_mask=True, low_energy_mask=low_energy_mask
-            )
-
-
-    if use_local_deep:
-        if P_method == 'both':
-            deep_dict_local, _, deep_mask_hard = deep_local_masking(Xt, P, Hlf, Tmask, Emask=Emask, P_method='vertices',
-                                                                    plot_mask=True)
-            deep_dict_local2, _, deep_mask_hard2 = deep_local_masking(Xt, P2, Hlf, Tmask, Emask=Emask2, P_method='prob',
-                                                                      plot_mask=True)
-        else:
-            deep_dict_local, _, deep_mask_hard = deep_local_masking(
-                Xt, P, Hlf, Tmask, Emask=Emask, P_method=P_method, plot_mask=True, low_energy_mask=low_energy_mask
-            )
 
     # --- Build list of mask strategies to evaluate ---
     dict_list = []
@@ -234,11 +206,6 @@ def run_pipeline(
         dict_list.append({
             'P': P, 'local_mask': Emask, 'P_method': P_method, 'local_method': 'NN', 'fh2': fh2
         })
-        if use_local_deep and deep_mask_hard is not None:
-            dict_list.append({
-                'P': P, 'local_mask': deep_mask_hard, 'P_method': P_method,
-                'local_method': 'SpatialNet', 'fh2': fh2
-            })
     dict_list.append({
         'P': pe, 'local_mask': Emask_pe, 'P_method': 'SPA', 'local_method': 'NN', 'fh2': fh2_pe
     })
@@ -447,10 +414,8 @@ def run_scenario(J, num_test_runs=30, overlap_demand=None, rev=CFG.low_rev, sign
         comparison_pairs = [('prob_NN', 'vertices_NN'), ('prob_NN', 'SPA_NN')]
         method_suffixes = ["ideal", "prob_NN", "vertices_NN", "best_global_NN", "SPA_NN"]
     else:
-        comparison_pairs = [('prob_NN', 'SPA_NN'), ('prob_SpatialNet', 'prob_NN')]
+        comparison_pairs = [('prob_NN', 'SPA_NN')]
         method_suffixes = ["ideal", f"{CFG.P_method}_NN", "SPA_NN"]
-        if CFG.use_local_deep:
-            method_suffixes.append(f"{CFG.P_method}_SpatialNet")
 
     comparison_table = compute_comparison_table(
         results, num_test_runs, comparison_pairs, method_suffixes=method_suffixes

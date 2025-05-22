@@ -13,9 +13,8 @@ from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
 
 import CFG
-from local_models import SpatialNet
 from global_models import BiLSTM_Att, MiSiCNet2, AutoEncoder
-from custom_losses import LocalLoss, SupervisedLoss, Unsupervised_Loss, find_best_permutation_supervised
+from custom_losses import SupervisedLoss, Unsupervised_Loss, find_best_permutation_supervised
 from functions import audio_scores, local_mapping, plot_masks, throwlow
 
 torch.manual_seed(42)
@@ -183,119 +182,6 @@ def global_method(input_mat, W_torch, first_non0, pr2, low_energy_mask_time, J=C
 
     return deep_dict, P, A
 
-
-def run_local_model(model, P, R, loss_function, num_epochs=CFG.epochs_local, lr=CFG.lr_local, max_norm=CFG.clip_grad_max, betas=CFG.betas, param_search=CFG.param_search_flag, plot_loss=False):
-    """
-        Train the local model to predict soft masks from RTF pre frequency (Hlf) and global P.
-
-        Args:
-            model (nn.Module): Local model (e.g., SpatialNet).
-            P (torch.Tensor): Global speaker probabilities [1, L, J].
-            R (torch.Tensor): Real-valued RTF-like features [1, F, L, 2(M-1)].
-            loss_function (nn.Module): Local loss.
-            num_epochs (int): Number of training epochs.
-            lr (float): Learning rate.
-
-        Returns:
-            dict: Dictionary with model outputs and metadata.
-    """
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=CFG.weight_decay, betas=betas)
-    scheduler = StepLR(optimizer, step_size=15, gamma=0.8)
-
-
-    P = P.to(CFG.device)
-    R = R.real.float().to(CFG.device)
-
-    if CFG.random_local_input:
-        uniform_noise = torch.distributions.Uniform(-0.1 ** 0.5, 0.1 ** 0.5).sample(R.shape)
-        gaussian_noise = torch.normal(mean=0, std=0.03 ** 0.5, size=R.shape)
-        input = (uniform_noise + gaussian_noise).to(CFG.device)
-        print('Using random local input...')
-    else:
-        input = R.clone()
-
-    patience = 30
-    patience_counter = 0
-
-    best_loss = float('inf')
-
-    for epoch in range(num_epochs):
-
-        model.train()
-
-        mask_output = model(input)
-
-
-        loss, loss_1, loss_2 = loss_function(mask_output, R=R.unsqueeze(0), P=P.unsqueeze(0))
-
-
-        optimizer.zero_grad()
-
-        loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_norm, norm_type=1)
-        optimizer.step()
-
-        scheduler.step()
-
-
-        if not param_search:
-            if epoch % 10 == 0:
-                print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {loss.item()}, RTF_loss: {loss_1.item()},"
-                      f" global_loss: {loss_2.item()}")
-
-
-        if best_loss > loss:
-            best_loss = loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch}")
-                break
-    model.eval()
-
-    if plot_loss:
-        loss_function.plot_loss()
-
-    d = {}
-    d['model_name'] = model.name
-    d['lr'] = lr
-    d['epochs'] = num_epochs
-    d['loss_name'] = loss_function.name
-    d['loss'] = round(loss.item(), 4)
-    # d['early_loss'] = round(early_loss, 4)
-    d['deep_mask'] = mask_output.detach()
-
-
-    return d
-
-def deep_local_masking(Xt, P, Hlf, Tmask, Emask=None, P_method=CFG.P_method, J=CFG.Q, plot_mask=False, plot_loss=False, lr=CFG.lr_local, betas=CFG.betas, RTF_factor=CFG.RTF_factor, global_factor=CFG.global_factor, epochs=CFG.epochs_local,
-                       num_layers=CFG.num_layers, dim_squeeze=CFG.dim_squeeze, encoder_kernel_size=CFG.encoder_kernel_size, kernel_size=CFG.kernel_size, conv_groups=CFG.conv_groups,
-                       param_search=CFG.param_search_flag, local_init_seed=CFG.local_init_seed, low_energy_mask=None):
-    """
-        Train SpatialNet to predict local TF masks from RTF features and global speaker probabilities.
-
-        Returns:
-            - dict: Training metadata and mask output.
-            - np.ndarray: Soft mask [L, J].
-            - np.ndarray: Hard mask [L] with speaker labels.
-    """
-    print("Running Deep Local Mapping...")
-    local_loss = LocalLoss(RTF_factor=RTF_factor, global_factor=global_factor).to(CFG.device)
-    local_model = SpatialNet(num_layers=num_layers, dim_squeeze=dim_squeeze, encoder_kernel_size=encoder_kernel_size,
-                             kernel_size=kernel_size, conv_groups=conv_groups, seed=local_init_seed, low_energy_mask=low_energy_mask).to(CFG.device)
-    deep_dict_local = run_local_model(local_model, torch.from_numpy(P), torch.from_numpy(Hlf), local_loss, lr=lr, betas=betas, plot_loss=plot_loss, param_search=param_search)
-
-    deep_mask_soft = deep_dict_local['deep_mask'].squeeze(0).detach().cpu().numpy()
-    deep_mask_hard = deep_mask_soft.argmax(axis=-1)
-
-    deep_mask_hard[low_energy_mask] = J
-
-    if plot_mask:
-        plot_masks(Tmask, deep_mask_hard, Emask, P_method=P_method)
-
-    return deep_dict_local, deep_mask_soft, deep_mask_hard
 
 def load_all_dicts(folder_path="array_data"):
     """Load all .pkl files and return a list of dictionaries."""
