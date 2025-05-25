@@ -173,7 +173,6 @@ def run_pipeline(
             P_method=P_method, Hlf=Hlf, low_energy_mask=low_energy_mask,
             dropout=CFG.dropout, K_dropout=CFG.K_dropout,
             run_multiple_initializations=CFG.run_multiple_initializations,
-            mask_input_ratio=CFG.mask_input_ratio,
             fixed_mask_input_ratio=CFG.fixed_mask_input_ratio,
             noise_col=CFG.noise_col, add_noise=CFG.add_noise,
         )

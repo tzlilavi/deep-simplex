@@ -123,7 +123,7 @@ def global_method(input_mat, W_torch, first_non0, pr2, low_energy_mask_time, J=C
                   epochs=CFG.epochs, betas=CFG.betas, n_repeat_last_lstm=CFG.n_repeat_last_lstm, n_heads=CFG.n_heads,
                   seed=CFG.global_seed, Hlf=None, low_energy_mask=None,
                   dropout=CFG.dropout, K_dropout=None, run_multiple_initializations=CFG.run_multiple_initializations
-                  , mask_input_ratio=CFG.mask_input_ratio, fixed_mask_input_ratio=CFG.fixed_mask_input_ratio,
+                  , fixed_mask_input_ratio=CFG.fixed_mask_input_ratio,
                   noise_col=CFG.noise_col, add_noise=CFG.add_noise):
     """
         Initialize and train a global deep model. Optionally run multiple initializations and reorder outputs.

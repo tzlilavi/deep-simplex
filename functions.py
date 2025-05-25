@@ -594,7 +594,7 @@ def audio_scores(pr2, P, Tmask, Emask,
     MD, FA, Err = MaskErr(Tmask, Emask, J)
 
     # Compute SDR, sisdr, ym
-    SDR, sisdr, ym = beamformer(Xt, Emask, xqf, J, fh2, olap, lens, 0.01, 1, CFG.fs, CFG.att, C=C_P)
+    SDR, sisdr, ym = beamformer(Xt, Emask, xqf, J, fh2, olap, lens, 0.01, 1, CFG.fs, CFG.att)
 
     # Compute STOI and PESQ
     um = np.nan_to_num(np.asarray(ym.real, dtype=np.float32))
