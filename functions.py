@@ -357,7 +357,6 @@ def find_top_active_indices(pe, P, P2, pr2, Ne=10, P_method=CFG.P_method, add_no
         Args:
             pe (np.ndarray): Probability matrix from SPA (L x (J + noise)).
             P (np.ndarray): Probability matrix from the deep model (L x (J + noise)).
-            P2 (np.ndarray): Secondary probability matrix (used when P_method == 'both').
             pr2 (np.ndarray): Ground truth probability matrix (L x (J + noise)).
             Ne (int): Number of top timeframes to return per speaker.
             P_method (str): Determines whether to also compute for P2.
@@ -384,9 +383,6 @@ def find_top_active_indices(pe, P, P2, pr2, Ne=10, P_method=CFG.P_method, add_no
         srow_pe = np.argsort(pe[:, q])[::-1]
         fh2_pe.append(srow_pe[:Ne])
 
-        if P_method=='both':
-            srow2 = np.argsort(P2[:, q])[::-1]
-            fh22.append(srow2[:Ne])
     return fh2, fh22, fh2_pe, fh
 
 def local_mapping(pe, P, P2, pr2, Hlf, Xt, low_energy_mask, J, f, t, P_method, model_tested,
@@ -398,7 +394,6 @@ def local_mapping(pe, P, P2, pr2, Hlf, Xt, low_energy_mask, J, f, t, P_method, m
         Args:
             pe (np.ndarray): SPA-estimated global probabilities (L x (J + noise)).
             P (np.ndarray): Deep model estimated global probabilities (L x (J + noise)).
-            P2 (np.ndarray): Second deep model (used when P_method == 'both').
             pr2 (np.ndarray): Ground truth probabilities (unused here).
             Hlf (np.ndarray): Local features per frequency (F x L x D).
             Xt (np.ndarray): Input STFT matrix (not used here).
@@ -437,10 +432,6 @@ def local_mapping(pe, P, P2, pr2, Hlf, Xt, low_energy_mask, J, f, t, P_method, m
         idk = np.argmax(decide, axis=1)
         Emask[kk, :] = idk
 
-        if P_method=='both':
-            decide2 = np.dot(p_dist_local, P2) / (np.tile(P2.sum(axis=0)+ 1e-12, (CFG.N_frames, 1)))
-            idk2 = np.argmax(decide2, axis=1)
-            Emask2[kk, :] = idk2
 
         decide_pe = np.dot(p_dist_local, pe) / (np.tile(pe.sum(axis=0) + 1e-12, (CFG.N_frames, 1)))
         idk_pe = np.argmax(decide_pe, axis=1)
@@ -450,9 +441,6 @@ def local_mapping(pe, P, P2, pr2, Hlf, Xt, low_energy_mask, J, f, t, P_method, m
         Emask[low_energy_mask] = J
         Emask[:, P[:, J] > 0.85] = J
 
-        if P_method == 'both':
-            Emask2[low_energy_mask] = J
-            Emask2[:, P[:, J] > 0.85] = J
 
         Emask_pe[low_energy_mask] = J
         Emask_pe[:, pe[:, J] > 0.85] = J
@@ -461,13 +449,9 @@ def local_mapping(pe, P, P2, pr2, Hlf, Xt, low_energy_mask, J, f, t, P_method, m
         Emask[low_energy_mask] = J
 
 
-        if P_method == 'both':
-            Emask2[low_energy_mask] = J
         Emask_pe[low_energy_mask] = J
 
     if plot_Emask:
-        plot_masks(Tmask, Emask_pe, Emask, P_method='vertices')
-
         plot_masks(Tmask, Emask_pe, Emask2, P_method='prob')
 
 
@@ -477,7 +461,7 @@ def local_mapping(pe, P, P2, pr2, Hlf, Xt, low_energy_mask, J, f, t, P_method, m
     return Emask, Emask2, Emask_pe
 
 
-def dist_scores(P, pr2, J, P_method):
+def dist_scores(P, pr2, J):
 
     mse = mean_squared_error(pr2[:, :J], P[:, :J])
 
@@ -548,7 +532,7 @@ def audio_scores(pr2, P, Tmask, Emask,
             fh (list): Indices of top frames by ground truth.
             J (int): Number of speakers.
             compute_ideal (bool): Whether to compute ideal performance for reference.
-            P_method (str): Global method used ('vertices' / 'prob').
+            P_method (str): Global method used ('prob').
             local_method (str): Local method used ('NN' / 'SpatialNet').
             print_scores (bool): Whether to print metrics.
 
@@ -560,7 +544,7 @@ def audio_scores(pr2, P, Tmask, Emask,
     olap, lens, att, fs = CFG.olap, CFG.lens, CFG.att, CFG.old_fs
 
     u_GT = np.nan_to_num(np.asarray(xqf[:, 0, :].real, dtype=np.float32))
-    L2 = dist_scores(P, pr2, J, P_method)
+    L2 = dist_scores(P, pr2, J)
     print(f'L2({P_method}, real): {L2:.4f}')
 
     # Compute ideal mask-based beamforming separation if requested
@@ -671,30 +655,6 @@ def calc_needed_audio_scores(dict_list, pr2, fh, Tmask, Hl, Xt, Hq, Xq, xqf, J=C
 
         first_run = False  # Ensure compute_ideal is only True for the first call
         results.update(scores)
-
-    if show_best_local:
-        best_local_key = "best_global_deep"
-        for metric in metrics:
-            key_vertices = f"{metric}_vertices_deep"
-            key_prob = f"{metric}_prob_deep"
-            if metric in ["L2_P", "MD", "FA", "Err"]:
-                results[f"{metric}_{best_local_key}"] = min(results.get(key_vertices, float('inf')),
-                                                            results.get(key_prob, float('inf')))
-            else:
-                results[f"{metric}_{best_local_key}"] = max(results.get(key_vertices, float('-inf')),
-                                                            results.get(key_prob, float('-inf')))
-
-    if show_best_global:
-        best_global_key = "best_global_NN"
-        for metric in metrics:
-            key_vertices = f"{metric}_vertices_NN"
-            key_prob = f"{metric}_prob_NN"
-            if metric in ["L2_P", "MD", "FA", "Err"]:
-                results[f"{metric}_{best_global_key}"] = min(results.get(key_vertices, float('inf')),
-                                                             results.get(key_prob, float('inf')))
-            else:
-                results[f"{metric}_{best_global_key}"] = max(results.get(key_vertices, float('-inf')),
-                                                             results.get(key_prob, float('-inf')))
 
     return results
 

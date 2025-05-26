@@ -66,7 +66,6 @@ class BiLSTM_Att(nn.Module):
             self,
             dim_input=CFG.N_frames + CFG.pad_tfs,
             dim_output=CFG.Q,
-            mult_heads=False,
             activation="GELU",
             hidden_size=(512, 256),
             n_repeat_last_lstm=1,
@@ -88,7 +87,6 @@ class BiLSTM_Att(nn.Module):
         self.input_size = dim_input
         self.output_size = dim_output
         self.hidden_size = hidden_size
-        self.mult_heads = mult_heads
         self.activation = activation
         self.dropout = dropout
         self.P_method = P_method
@@ -222,36 +220,18 @@ class BiLSTM_Att(nn.Module):
         if self.dropout:
             y = self.dropout4(y)
 
-        if self.mult_heads:
-            P = {}
 
-            for i in range(3, 6):
-                linear_layer = getattr(self, f"linear{i}")
-                y_linear = self.activation_func(linear_layer(torch.transpose(y, 1, 2)))
-                P[i] = F.softmax(y_linear, dim=-1)
-
-            W = self.decoder(P[3])
-        else:
-            y = self.activation_func(self.linear(torch.transpose(y, 1, 2)))
-            y = y.reshape(B, L, self.output_size)
+        y = self.activation_func(self.linear(torch.transpose(y, 1, 2)))
+        y = y.reshape(B, L, self.output_size)
 
 
-            A = F.softmax(y.squeeze(0), dim=0)
+        A = F.softmax(y.squeeze(0), dim=0)
 
-            As = A.detach().cpu().numpy()
-            top_vals = np.sort(As, axis=0)[-3:][::-1]
-            if self.P_method=='prob':
-                P = F.softmax(y, dim=-1)  ## [b, L , J+1]
-                E = F.softmax(self.decoder.weight.unsqueeze(0), dim=-1)
-            elif self.P_method=='vertices':
-                E = F.softmax(y, dim=-1)  ## [b, L , J+1]
+        As = A.detach().cpu().numpy()
+        top_vals = np.sort(As, axis=0)[-3:][::-1]
 
-
-                P = torch.matmul(W.squeeze(0), A)
-                P = P * (P > 0)
-                P[P.sum(1) > 1, :] = P[P.sum(1) > 1, :] / P[P.sum(1) > 1, :].sum(1, keepdims=True)
-
-                P = P.unsqueeze(0)
+        P = F.softmax(y, dim=-1)  ## [b, L , J+1]
+        E = F.softmax(self.decoder.weight.unsqueeze(0), dim=-1)
 
 
         if self.low_energy_mask is not None:
@@ -349,18 +329,11 @@ class MiSiCNet2(nn.Module):
         x = self.fc1(x) ## [b, L , J+noisedim]
         no_pad_x = x[:, CFG.pad_tfs:-CFG.pad_tfs, :]
 
-        if self.P_method=='prob':
-            P = F.softmax(x, dim=-1)  ## [b, L , J+1]
-            A = torch.zeros((CFG.N_frames, self.output_size)).to(CFG.device)
-            A[CFG.pad_tfs:-CFG.pad_tfs, :] = F.softmax(no_pad_x.squeeze(0), dim=0)
 
-        elif self.P_method=='vertices':
-            A = torch.zeros((CFG.N_frames, self.output_size)).to(CFG.device)
-            A[CFG.pad_tfs:-CFG.pad_tfs, :] = F.softmax(no_pad_x.squeeze(0), dim=0)
-            P = torch.matmul(y.squeeze(0), A)
-            P = P * (P > 0)
-            P[P.sum(1) > 1, :] = P[P.sum(1) > 1, :] / P[P.sum(1) > 1, :].sum(1, keepdims=True)
-            P = P.unsqueeze(0)
+        P = F.softmax(x, dim=-1)  ## [b, L , J+1]
+        A = torch.zeros((CFG.N_frames, self.output_size)).to(CFG.device)
+        A[CFG.pad_tfs:-CFG.pad_tfs, :] = F.softmax(no_pad_x.squeeze(0), dim=0)
+
 
 
         W = self.decoder(P)

@@ -29,7 +29,7 @@ param_tries = 40
 loss_plot_flag = True
 
 # === Evaluation & Testing ===
-P_methods = ['vertices', 'prob', 'both']
+P_methods = 'prob'
 P_method = P_methods[1]  # Default to 'prob'
 num_test_runs = 30
 

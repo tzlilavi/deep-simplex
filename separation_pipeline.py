@@ -50,7 +50,7 @@ def run_pipeline(
         previous_combinations (set): Track used speaker combinations (Libri).
         J (int): Number of sources/speakers.
         run_number (int): Index of run (for logging/debug).
-        P_method (str): Global model variant to run ("prob", "vertices", or "both").
+        P_method (str): Global model variant to run ("prob").
         speakers (list): Optional speaker IDs.
         combined_data (tuple): Precomputed data tuple (can skip simulation).
         overlap_demand (float): Overlap setting (typically 0.3–1).
@@ -130,57 +130,23 @@ def run_pipeline(
         input_mat = uniform_noise + gaussian_noise
 
     # --- Global model inference ---
-    P2 = None
-    if P_method == 'both':
-        print('Running vertices model')
-        deep_dict_global, P, A = global_method(
-            input_mat, W_torch, first_non0, pr2, low_energy_mask_time, J=J,
-            P_method='vertices', Hlf=Hlf, low_energy_mask=low_energy_mask,
-            dropout=CFG.dropout, K_dropout=CFG.K_dropout,
-            run_multiple_initializations=CFG.run_multiple_initializations,
-            mask_input_ratio=CFG.mask_input_ratio,
-            fixed_mask_input_ratio=CFG.fixed_mask_input_ratio,
-            noise_col=CFG.noise_col, add_noise=CFG.add_noise,
-        )
-        # plot_results(P, pr2, pe, id0, J=J)
-        top_indices = np.argsort(A, axis=0)[-3:][::-1]
-        top_vals = np.sort(A, axis=0)[-3:][::-1]
-        # np.set_printoptions(precision=3, suppress=True)
-        # print(f'A top values:\n{top_vals}')
-        #
 
-        print('Running probabilistic model')
-        start_time = time.time()
-        deep_dict_global2, P2, _ = global_method(
-            input_mat, W_torch, first_non0, pr2, low_energy_mask_time, J=J,
-            P_method='prob', Hlf=Hlf, low_energy_mask=low_energy_mask,
-            dropout=CFG.dropout, K_dropout=CFG.K_dropout,
-            run_multiple_initializations=CFG.run_multiple_initializations,
-            mask_input_ratio=CFG.mask_input_ratio,
-            fixed_mask_input_ratio=CFG.fixed_mask_input_ratio,
-            noise_col=CFG.noise_col, add_noise=CFG.add_noise,
-        )
-        print(f"Probabilistic model ran in {time.time() - start_time:.2f} seconds")
-        plot_results(P2, pr2, pe, id0, J=J, t=t, plot_flag=True, noise_P=deep_dict_global2['P_noise'])
-
-        # plot3d_simplex(pr2, top_indices, title='pr2 with Amodel top vertices Simplex', azim=30, elev=30)
-    else:
-        print(f'Running {P_method} model')
-        start_time = time.time()
-        A = None
-        deep_dict_global, P, _ = global_method(
-            input_mat, W_torch, first_non0, pr2, low_energy_mask_time, J=J,
-            P_method=P_method, Hlf=Hlf, low_energy_mask=low_energy_mask,
-            dropout=CFG.dropout, K_dropout=CFG.K_dropout,
-            run_multiple_initializations=CFG.run_multiple_initializations,
-            fixed_mask_input_ratio=CFG.fixed_mask_input_ratio,
-            noise_col=CFG.noise_col, add_noise=CFG.add_noise,
-        )
-        print(f"{P_method} model ran in {time.time() - start_time:.2f} seconds")
-        plot_results(P, pr2, pe, id0, J=J, t=t, plot_flag=True, noise_P=deep_dict_global['P_noise'])
+    print(f'Running {P_method} model')
+    start_time = time.time()
+    A = None
+    deep_dict_global, P, _ = global_method(
+        input_mat, W_torch, first_non0, pr2, low_energy_mask_time, J=J,
+        P_method=P_method, Hlf=Hlf, low_energy_mask=low_energy_mask,
+        dropout=CFG.dropout, K_dropout=CFG.K_dropout,
+        run_multiple_initializations=CFG.run_multiple_initializations,
+        fixed_mask_input_ratio=CFG.fixed_mask_input_ratio,
+        noise_col=CFG.noise_col, add_noise=CFG.add_noise,
+    )
+    print(f"{P_method} model ran in {time.time() - start_time:.2f} seconds")
+    plot_results(P, pr2, pe, id0, J=J, t=t, plot_flag=True, noise_P=deep_dict_global['P_noise'])
 
     # --- Local mask standard estimation ---
-
+    P2 = None
     fh2, fh22, fh2_pe, fh = find_top_active_indices(pe, P, P2, pr2, P_method=P_method, add_noise=CFG.add_noise)
 
     Emask, Emask2, Emask_pe = local_mapping(
@@ -195,16 +161,10 @@ def run_pipeline(
     dict_list = []
     show_best_global = False
 
-    if P_method == 'both':
-        dict_list.extend([
-            {'P': P, 'local_mask': Emask, 'P_method': 'vertices', 'local_method': 'NN', 'fh2': fh2},
-            {'P': P2, 'local_mask': Emask2, 'P_method': 'prob', 'local_method': 'NN', 'fh2': fh22},
-        ])
-        show_best_global = True
-    else:
-        dict_list.append({
-            'P': P, 'local_mask': Emask, 'P_method': P_method, 'local_method': 'NN', 'fh2': fh2
-        })
+
+    dict_list.append({
+        'P': P, 'local_mask': Emask, 'P_method': P_method, 'local_method': 'NN', 'fh2': fh2
+    })
     dict_list.append({
         'P': pe, 'local_mask': Emask_pe, 'P_method': 'SPA', 'local_method': 'NN', 'fh2': fh2_pe
     })
@@ -409,12 +369,9 @@ def run_scenario(J, num_test_runs=30, overlap_demand=None, rev=CFG.low_rev, sign
     print('rev:', rev)
 
     # --- Set up metric comparisons ---
-    if CFG.P_method == 'both':
-        comparison_pairs = [('prob_NN', 'vertices_NN'), ('prob_NN', 'SPA_NN')]
-        method_suffixes = ["ideal", "prob_NN", "vertices_NN", "best_global_NN", "SPA_NN"]
-    else:
-        comparison_pairs = [('prob_NN', 'SPA_NN')]
-        method_suffixes = ["ideal", f"{CFG.P_method}_NN", "SPA_NN"]
+
+    comparison_pairs = [('prob_NN', 'SPA_NN')]
+    method_suffixes = ["ideal", f"{CFG.P_method}_NN", "SPA_NN"]
 
     comparison_table = compute_comparison_table(
         results, num_test_runs, comparison_pairs, method_suffixes=method_suffixes
@@ -460,5 +417,5 @@ if __name__ == "__main__":
     #         for overlap in overlaps:
     #
     #             table = run_scenario(J=J, rev=rev, num_test_runs=num_exps, overlap_demand=overlap)
-    table = run_scenario(J=3, rev=0.3, num_test_runs=num_exps, overlap_demand=1, data_mode='libri')
+    table = run_scenario(J=3, rev=0.3, num_test_runs=2, overlap_demand=1, data_mode='libri')
 

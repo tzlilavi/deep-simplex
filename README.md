@@ -82,12 +82,11 @@ For questions or collaborations, contact: **tzlilavidan@mail.tau.ac.il**
 
 ### Core Methods
 
-- **GLOSS (Simplex)**  
-  Dovrat, Y., Shon, S., Jansson, A., & Glass, J.  
-  _Global Latent Optimization for Source Separation_  
+- **GLOSS (Global and Local Simplex Separation)**  
+  Bracha Laufer-Goldshtein, Ronen Talmon, and Sharon Gannot  
+  _Global and Local Simplex Representations for Multichannel Source Separation_  
   IEEE Transactions on Audio, Speech, and Language Processing, 2020  
-  [arXiv:2001.10772](https://arxiv.org/abs/2001.10772)  
-  [Code](https://github.com/yluo42/TAC)
+  [IEEE Link](https://ieeexplore.ieee.org/document/9099054)
 
 - **MiSiCNet**  
   Jin, Y., Deng, B., Xie, Y., & Zhu, F.  
