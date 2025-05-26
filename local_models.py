@@ -5,7 +5,7 @@ from spatial_net_utils.non_linear import *
 from spatial_net_utils.linear_group import LinearGroup
 from torch.nn import MultiheadAttention
 from functions import *
-CFG.set_mode('unsupervised')
+
 
 
 class SpatialNetLayer(nn.Module):

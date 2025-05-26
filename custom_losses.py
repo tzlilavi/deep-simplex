@@ -87,6 +87,8 @@ class Unsupervised_Loss(nn.Module):
         PPt_output = torch.bmm(P_scaled, P_scaled.transpose(1, 2))
         ## Enforcing P diagonal elements 1 to match W
         PPt_output[:, range(self.first_non0, CFG.N_frames), range(self.first_non0, CFG.N_frames)] = 1
+        # PPt_output = PPt_output + torch.diag(torch.sum(((1 - P_scaled) * P_scaled), dim=-1).squeeze(0)).unsqueeze(0)
+
 
         if self.input_mask is not None:
             PPt_output = PPt_output * self.input_mask
