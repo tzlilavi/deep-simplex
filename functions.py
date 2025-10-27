@@ -7,12 +7,13 @@ import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+import torch.nn.functional as Functional
 from pesq import pesq
 from pystoi import stoi
 from scipy import signal
 from scipy.spatial import distance_matrix
-from sklearn.metrics import mean_squared_error
-
+from sklearn.metrics import mean_squared_error, pairwise
+import soundfile as sf
 import CFG
 import torchiva
 from beamforming import beamformer, bss_eval_sources, MVDR_over_speakers
@@ -20,7 +21,8 @@ from custom_losses import find_best_permutation_supervised, SupervisedLoss
 from torchmetrics.functional.audio import scale_invariant_signal_distortion_ratio as t_audio_SI_SDR
 from torchmetrics.functional.audio import signal_distortion_ratio as t_audio_SDR
 from utils import throwlow, findextremeSPA, FeatureExtr, smoother
-
+from scipy.io.wavfile import write
+# from speechbrain.inference.speaker import EncoderClassifier
 random.seed(CFG.seed0)
 np.random.seed(CFG.seed0)
 
@@ -230,7 +232,7 @@ def plot_P_speakers(speakers, plot_name, figs_directory, noise=None, title=None,
     if show_flag:
         plt.show()
 
-def plot_results(P, pr2, pe, id0=None, J=CFG.Q, no_title=False, plot_flag=CFG.plot_flag, t=None, SISDRs=None, noise_P=None):
+def plot_results(P, pr2, pe, id0=None, J=CFG.Q, no_title=False, plot_flag=CFG.plot_flag, t=None, SISDRs=None, noise_P=None, third_title='Standard Simplex'):
     if not plot_flag:
         return
 
@@ -248,7 +250,7 @@ def plot_results(P, pr2, pe, id0=None, J=CFG.Q, no_title=False, plot_flag=CFG.pl
         else:
             title_ideal = f'Ideal global speaker probabilities'
             title_deep = f'Deep Simplex global speaker probabilities'
-            title_simplex = f'Standard Simplex global speaker probabilities'
+            title_simplex = third_title + f' global speaker probabilities'
 
     noise_pr2 = None
     noise_pe = None
@@ -384,7 +386,7 @@ def find_top_active_indices(pe, P, P2, pr2, Ne=10, P_method=CFG.P_method, add_no
         srow_pe = np.argsort(pe[:, q])[::-1]
         fh2_pe.append(srow_pe[:Ne])
 
-        if P_method=='both':
+        if P_method=='both' or CFG.combined_flag:
             srow2 = np.argsort(P2[:, q])[::-1]
             fh22.append(srow2[:Ne])
     return fh2, fh22, fh2_pe, fh
@@ -426,6 +428,8 @@ def local_mapping(pe, P, P2, pr2, Hlf, Xt, low_energy_mask, J, f, t, P_method, m
     Emask_pe = np.zeros((CFG.NFFT // 2 + 1, CFG.N_frames))
     lenF0 = len(CFG.F0)
 
+    soft_Emask = np.zeros((CFG.NFFT // 2 + 1, CFG.N_frames, J))
+    temp = 0.1
     for kk in range(CFG.NFFT // 2 + 1):
         # Compute similarity matrix using gaussian kernel based on Euclidean distances with a  in feature space
         pdistEE = distance_matrix(Hlf[kk,:,:], Hlf[kk,:,:])
@@ -436,6 +440,9 @@ def local_mapping(pe, P, P2, pr2, Hlf, Xt, low_energy_mask, J, f, t, P_method, m
         decide = np.dot(p_dist_local, P) / (np.tile(P.sum(axis=0) + 1e-12, (CFG.N_frames, 1)))
         idk = np.argmax(decide, axis=1)
         Emask[kk, :] = idk
+
+        soft_Emask[kk, :, :] = softmax_stable(decide / temp, axis=-1)
+
 
         if P_method=='both':
             decide2 = np.dot(p_dist_local, P2) / (np.tile(P2.sum(axis=0)+ 1e-12, (CFG.N_frames, 1)))
@@ -474,8 +481,15 @@ def local_mapping(pe, P, P2, pr2, Hlf, Xt, low_energy_mask, J, f, t, P_method, m
 
 
 
-    return Emask, Emask2, Emask_pe
+    return Emask, Emask2, Emask_pe, soft_Emask
 
+def softmax_stable(x, axis=-1):
+    """
+    Numerically stable softmax along the specified axis.
+    """
+    x_max = np.max(x, axis=axis, keepdims=True)
+    e_x = np.exp(x - x_max)
+    return e_x / (np.sum(e_x, axis=axis, keepdims=True) + 1e-12)
 
 def dist_scores(P, pr2, J, P_method):
 
@@ -533,7 +547,8 @@ def compute_true_RTFs_from_Xq(Xq):
 
 def audio_scores(pr2, P, Tmask, Emask,
                  Hl, Xt, Hq, Xq, xqf, fh2, fh, J=CFG.Q, compute_ideal=False,
-                 P_method=CFG.P_method, local_method='NN', print_scores=True):
+                 P_method=CFG.P_method, local_method='NN', print_scores=True, wav_folder='wav_examples',
+                 save_wavs=CFG.save_wavs_flag, model_tested='', d=None):
     """
         Computes separation quality metrics (MSE (L2), SDR, SI-SDR, PESQ, STOI, MaskErr, MD, FA)
         for a given global estimate P and corresponding local mask Emask.
@@ -557,6 +572,7 @@ def audio_scores(pr2, P, Tmask, Emask,
         """
 
     key_suffix = P_method + '_' + local_method
+
     olap, lens, att, fs = CFG.olap, CFG.lens, CFG.att, CFG.old_fs
 
     u_GT = np.nan_to_num(np.asarray(xqf[:, 0, :].real, dtype=np.float32))
@@ -594,7 +610,12 @@ def audio_scores(pr2, P, Tmask, Emask,
     MD, FA, Err = MaskErr(Tmask, Emask, J)
 
     # Compute SDR, sisdr, ym
-    SDR, sisdr, ym = beamformer(Xt, Emask, xqf, J, fh2, olap, lens, 0.01, 1, CFG.fs, CFG.att)
+    P_signals = None
+    apply_mask = 1
+    if 'P_signals' in d:
+        P_signals = d['P_signals'].T
+        apply_mask = 0
+    SDR, sisdr, ym = beamformer(Xt, Emask, xqf, J, fh2, olap, lens, 0.01, apply_mask, CFG.fs, CFG.att, P_signals=P_signals)
 
     # Compute STOI and PESQ
     um = np.nan_to_num(np.asarray(ym.real, dtype=np.float32))
@@ -605,10 +626,41 @@ def audio_scores(pr2, P, Tmask, Emask,
     if print_scores:
         # print(f'{global_name} {local_name} MD and FA: {MD:.2f} {FA:.2f}')
         print(f'{P_method} {local_method} SDR and SI-SDR: {SDR:.2f} {sisdr:.2f}')
+        print(f'{P_method} {local_method} Mask Error: {Err:.2f}')
         # print(f'{global_name} {local_name} STOI and PESQ: {stoi_score:.3f}, {pesq_score:.3f}')
+
+    # X_Encoder = EncoderClassifier.from_hparams(source="speechbrain/spkrec-xvect-voxceleb",
+    #                                            savedir="pretrained_models/spkrec-xvect-voxceleb",
+    #                                            run_opts={'device': CFG.device})
+    # X_vectors_gt = X_Encoder.encode_batch(torch.from_numpy(xqf[:, 0, :].T)).squeeze(1).cpu().detach().numpy()
 
     # Return computed values in dictionary
     if compute_ideal:
+
+###############
+        # n_fft = CFG.NFFT
+        # win_length = CFG.NFFT
+        # olap = CFG.olap
+        # hop_length = int(n_fft - olap * win_length)
+        # enhanced_stft = torch.from_numpy((Tmask[None, :, :] == np.arange(J)[:, None, None]) * Xt[:, :, 0])
+        # window = torch.hann_window(win_length, device=enhanced_stft.device)
+        # enhanced_waveform_i = torch.istft(input=enhanced_stft, n_fft=n_fft,
+        #                                   hop_length=hop_length,
+        #                                   win_length=win_length, window=window, center=True,
+        #                                   return_complex=False, ).float().T.numpy()
+        # X_vectors_i = X_Encoder.encode_batch(torch.from_numpy(enhanced_waveform_i.T)).squeeze(1).cpu().detach().numpy()
+        # cos_sim_i = pairwise.cosine_similarity(X_vectors_gt, X_vectors_i)
+        # cos_similarity_i = cos_sim_i[np.eye(J) == 1].mean()
+        # cos_similarity_perm_i = cos_sim_i[np.eye(J) == 0].mean()
+        #
+        # print(
+        #     f'Ideal mask X_vectors cos_similarity and permutated cos_similarity: {cos_similarity_i:.2f} {cos_similarity_perm_i:.2f}')
+        # cos_sim_spk_i = pairwise.cosine_similarity(xqf[:, 0, :].T, enhanced_waveform_i[:xqf.shape[0],:].T)
+        # cos_similarity_spk_i = cos_sim_spk_i[np.eye(J) == 1].mean()
+        # cos_similarity_perm_spk_i = cos_sim_spk_i[np.eye(J) == 0].mean()
+        # print(
+        #     f'Ideal mask speakers cos_similarity and permutated cos_similarity: {cos_similarity_spk_i:.2f} {cos_similarity_perm_spk_i:.2f}')
+###############3
         scores = {
             f'L2_P_ideal': 0, f'Err_ideal': 0,
             f"MD_ideal": 0, f"FA_ideal": 0,
@@ -629,10 +681,44 @@ def audio_scores(pr2, P, Tmask, Emask,
             f"MD_{key_suffix}": MD, f"FA_{key_suffix}": FA, f"SDR_{key_suffix}": SDR, f"si-sdr_{key_suffix}": sisdr,
             f"stoi_{key_suffix}": stoi_score, f"pesq_{key_suffix}": pesq_score
         }
+    if save_wavs:
+        os.makedirs(wav_folder, exist_ok=True)
+        for q in range(J):
+            if compute_ideal:
+                sf.write(os.path.join(wav_folder, f'ideal_speaker_{q}.wav'), yi[:, q].real, fs)
+
+            sf.write(os.path.join(wav_folder, f'est_speaker_{q}_{model_tested}.wav'), ym[:, q].real, fs)
+#######################
+    # n_fft = CFG.NFFT
+    # win_length = CFG.NFFT
+    # olap = CFG.olap
+    # hop_length = int(n_fft - olap * win_length)
+    # enhanced_stft = torch.from_numpy((Emask[None, :, :] == np.arange(J)[:, None, None]) * Xt[:, :, 0])
+    # window = torch.hann_window(win_length, device=enhanced_stft.device)
+    # enhanced_waveform = torch.istft(input=enhanced_stft, n_fft=n_fft,
+    #                                   hop_length=hop_length,
+    #                                   win_length=win_length, window=window, center=True,
+    #                                   return_complex=False, ).float().T.numpy()
+
+    # X_vectors_model = X_Encoder.encode_batch(torch.from_numpy(enhanced_waveform.T)).squeeze(1).cpu().detach().numpy()
+    # cos_sim = pairwise.cosine_similarity(X_vectors_gt, X_vectors_model)
+    # cos_similarity = cos_sim[np.eye(J) == 1].mean()
+    # cos_similarity_perm = cos_sim[np.eye(J) == 0].mean()
+    # print(
+    #     f'{local_method} mask X_vectors cos_similarity and permutated cos_similarity: {cos_similarity:.2f} {cos_similarity_perm:.2f}')
+    #
+    # cos_sim_spk = pairwise.cosine_similarity(xqf[:, 0, :].T, enhanced_waveform[:xqf.shape[0], :].T)
+    # cos_similarity_spk = cos_sim_spk[np.eye(J) == 1].mean()
+    # cos_similarity_perm_spk = cos_sim_spk[np.eye(J) == 0].mean()
+    #
+    # print(
+    #     f'{local_method} mask speakers cos_similarity and permutated cos_similarity: {cos_similarity_spk:.2f} {cos_similarity_perm_spk:.2f}')
+#############
     return scores
 
 
-def calc_needed_audio_scores(dict_list, pr2, fh, Tmask, Hl, Xt, Hq, Xq, xqf, J=CFG.Q, show_best_local=True, show_best_global=True, print_scores=True):
+def calc_needed_audio_scores(dict_list, pr2, fh, Tmask, Hl, Xt, Hq, Xq, xqf, J=CFG.Q, show_best_local=True,
+                             show_best_global=True, print_scores=True, save_wavs=CFG.save_wavs_flag):
     """
         Runs audio evaluation (SDR, PESQ, STOI, etc.) for a list of (P, mask) configurations.
 
@@ -666,7 +752,9 @@ def calc_needed_audio_scores(dict_list, pr2, fh, Tmask, Hl, Xt, Hq, Xq, xqf, J=C
             compute_ideal=first_run,  # Compute ideal only for the first run
             P_method=P_method,
             local_method=local_method,
-            print_scores=print_scores
+            print_scores=print_scores,
+            save_wavs=save_wavs,
+            model_tested=f'{P_method}_{local_method}', d=d
         )
 
         first_run = False  # Ensure compute_ideal is only True for the first call
@@ -769,6 +857,14 @@ def cosine_sim(P):
     return cos_sim_avg.mean()
 
 
+def add_noise(signal, snr_db):
+    """Adds white Gaussian noise to a signal at a specific SNR."""
+    signal = signal.astype(np.float32)
+    rms_signal = np.sqrt(np.mean(signal**2))
+    snr_linear = 10 ** (snr_db / 10)
+    rms_noise = rms_signal / np.sqrt(snr_linear)
+    noise = np.random.normal(0, rms_noise, signal.shape).astype(np.float32)
+    return signal + noise
 
 def compute_rmse(x_true, x_pre):
     squared_diff = (x_true - x_pre) ** 2
@@ -891,6 +987,126 @@ def plot_masks(Tmask, deep_mask, Emask=None, P_method=CFG.P_method):
     plt.subplots_adjust(right=0.85)  # Adjust space to fit the colorbar
     plt.show()
 
+def show_heatmap(mat, title):
+    plt.figure()
+    plt.imshow(mat, aspect='auto')  # don’t set colors explicitly
+    plt.title(title)
+    plt.xlabel('t2')
+    plt.ylabel('t1')
+    plt.colorbar()
+    plt.tight_layout()
+
+def plot_avg_correlation_matrices(matrix_list, matrix_names, mics=CFG.M, plot_flag=True):
+    """
+    Plots the average correlation (covariance) matrices for a list of frequency-dependent input matrices.
+
+    Args:
+        matrix_list (List[np.ndarray]): List of matrices of shape (F, T, x_i) where x_i may vary.
+        matrix_names (List[str]): List of names for each matrix (same order as matrix_list).
+        plot_flag (bool): If True, plots the results.
+
+    Returns:
+        avg_corrs (List[np.ndarray]): List of average correlation matrices (each of shape T x T).
+    """
+
+    avg_corrs = None
+    if plot_flag:
+        avg_corrs = []
+
+        for matrix, name in zip(matrix_list, matrix_names):
+            if len(matrix.shape)==2:
+                onehot_matrix = np.zeros((F, T , last_dim))
+                onehot_matrix[np.arange(F)[:, None], np.arange(T), matrix] = 1
+                matrix = onehot_matrix
+            F, T, last_dim = matrix.shape
+            corr_f = np.zeros((F, T, T), dtype=np.float32)
+            for f in range(F):
+                corr_f[f] = matrix[f] @ matrix[f].T
+            avg_corr = corr_f.mean(axis=0)
+            avg_corrs.append(avg_corr)
+
+
+        num_plots = len(matrix_list)
+        fig, axes = plt.subplots(1, num_plots, figsize=(6 * num_plots, 5))
+
+        if num_plots == 1:
+            axes = [axes]
+
+        for i, (avg_corr, name) in enumerate(zip(avg_corrs, matrix_names)):
+            im = axes[i].imshow(avg_corr, cmap='viridis')
+            axes[i].set_title(f'Avg {name} Correlation ({name}[f] @ {name}[f]ᵀ)')
+            fig.colorbar(im, ax=axes[i])
+
+        plt.tight_layout()
+        plt.show()
+
+    return avg_corrs
+
+import numpy as np
+import matplotlib.pyplot as plt
+
+def plot_adjacency_matrices(matrix_list, matrix_names, plot_flag=True, suptitle=None):
+    """
+    Plots adjacency matrices (each of shape T x T) side by side.
+
+    Args:
+        matrix_list (List[np.ndarray]): List of adjacency matrices (each T x T).
+        matrix_names (List[str]): List of names for each matrix.
+        plot_flag (bool): If True, plots the results.
+        suptitle (str): Optional main title.
+
+    Returns:
+        matrix_list (List[np.ndarray]): The same matrices, for convenience.
+    """
+    if len(matrix_list) != len(matrix_names):
+        raise ValueError("matrix_list and matrix_names must have same length.")
+
+    if plot_flag:
+        num_plots = len(matrix_list)
+        fig, axes = plt.subplots(1, num_plots, figsize=(5 * num_plots, 4))
+
+        if num_plots == 1:
+            axes = [axes]
+
+        if suptitle:
+            fig.suptitle(suptitle, fontsize=14, y=1.02)
+
+        for ax, mat, name in zip(axes, matrix_list, matrix_names):
+            if isinstance(mat, np.ndarray):
+                m = mat
+            else:
+                m = mat.detach().cpu().numpy()  # if torch.Tensor
+            im = ax.imshow(m, aspect='auto')
+            ax.set_title(name)
+            ax.set_xlabel("t2")
+            ax.set_ylabel("t1")
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+        plt.tight_layout()
+        plt.show()
+
+    return matrix_list
+
+def plot_mask_speakers(matrix_list, matrix_names, title=None):
+    num_plots = len(matrix_list)
+    J = matrix_list[0].shape[-1]
+    import matplotlib.pyplot as plt
+    num_plots = len(matrix_list)
+    fig, axes = plt.subplots(J, num_plots, figsize=(5 * num_plots, 4))
+    matrix_list = [mat.detach().cpu().numpy() for mat in matrix_list]
+    if title:
+        fig.suptitle(title, fontsize=14, y=0.97)
+    for j in range(axes.shape[0]):
+        for m in range(axes.shape[1]):
+            im = axes[j, m].imshow(matrix_list[m][:, :, j], aspect='auto')
+            axes[j, m].set_title(matrix_names[m] + str(j))
+            axes[j, m].set_xlabel("t2")
+            axes[j, m].set_ylabel("t1")
+        fig.colorbar(im, ax=axes[j, m], fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    plt.show()
+
 def calc_auxip(Xt, y, J=CFG.Q, NFFT=CFG.NFFT, olap=CFG.olap, fs=CFG.fs):
     aux = torchiva.AuxIVA_IP(n_iter=30, n_src=y.shape[-1])
     Xt = Xt.transpose(2, 0, 1)
@@ -923,6 +1139,20 @@ def calc_auxip(Xt, y, J=CFG.Q, NFFT=CFG.NFFT, olap=CFG.olap, fs=CFG.fs):
     st = np.mean([stoi(ui[:, j], um[:, j], fs) for j in range(J)])
     pesq = calc_psq(ui, um)
     return SDR, max_sisdr, st, pesq
+
+def save_signals_as_wav_scipy(signals: torch.Tensor, sample_rate: int = CFG.old_fs, prefix: str = "signal"):
+    s = signals.detach().cpu().numpy()
+    for j in range(s.shape[1]):
+        # Normalize to avoid clipping
+        x = s[:, j]
+        x = x / np.max(np.abs(x) + 1e-8)
+        x_int16 = np.int16(x * 32767)
+        filename = f"{prefix}_speaker{j+1}.wav"
+        write(filename, sample_rate, x_int16)
+        print(f"✅ Saved: {filename}")
+
+
+
 
 #
 # if __name__ == '__main__':

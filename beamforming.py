@@ -133,7 +133,7 @@ def compute_R_xt(Xt):
     return R
 
 def beamformer(Xt, mask, xq, Q, fh, olap, lens, a, apply_mask, fs, att=0.3, Xq=None, Hq=None, Hl=None, C=None,
-               b=0.01):
+               b=0.01, P_signals=None):
     """
         Perform LCMV beamforming to separate sources from multichannel input.
 
@@ -158,15 +158,15 @@ def beamformer(Xt, mask, xq, Q, fh, olap, lens, a, apply_mask, fs, att=0.3, Xq=N
     NFFT = 2 * (Xt.shape[0] - 1)
     if Hq is not None:
         H = Hq
-    elif apply_mask:
-        if CFG.add_noise:
-            H, R, _ = RTFsmaskandNoiseCovEst2(Xt, Xt, mask, Q, fh)
-        else:
-            H = RTFsmaskEst2(Xt, mask, Q, fh)
-            R = compute_R_xt(Xt)
 
+    if CFG.add_noise:
+        H, R, _ = RTFsmaskandNoiseCovEst2(Xt, Xt, mask, Q, fh)
     else:
-        H = RTFsmaskEst2(Xq, None, Q, fh)
+        H = RTFsmaskEst2(Xt, mask, Q, fh)
+        R = compute_R_xt(Xt)
+
+    # else:
+    #     H = RTFsmaskEst2(Xq, None, Q, fh)
 
     #
     if CFG.add_noise:
@@ -215,6 +215,11 @@ def beamformer(Xt, mask, xq, Q, fh, olap, lens, a, apply_mask, fs, att=0.3, Xq=N
             best_perm = perm
 
     SDR = t_audio_SDR(best_y, y_torch).mean().item()
+
+    if P_signals is not None:
+        print(SDR)
+        print(t_audio_SDR(P_signals, y_torch).mean().item())
+        n=5
     sisdr = max_sisdr
 
     return SDR, sisdr, ym[:, best_perm]
@@ -248,7 +253,7 @@ def lcmv_nonoise(Xt, H, olap, lens, a, fs):
     yo = np.zeros((lens, Q), dtype=np.complex128)
     leni = (L - 1) * olap * NFFT + NFFT
     for q in range(Q):
-        yo[:, q] = istft(Yo[:, :, q], nperseg=NFFT, noverlap=olap * NFFT, nfft=NFFT, fs=fs)[1][:yo.shape[0]]
+        yo[:, q] = istft(Yo[:, :, q], nperseg=NFFT, noverlap=olap * NFFT, nfft=NFFT, fs=fs)[1][:yo[:, q].shape[0]]
 
     return yo, Yo
 
@@ -274,7 +279,12 @@ def RTFsmaskEst2(X, mask, Q, fk):
 
                 # Estimate the covariance matrix for the speaker
 
-                Rxk = np.dot(np.transpose(X[k - 1, fkq, :]), np.conj(X[k - 1, fkq, :])) / Nfkq
+                try:
+                    Rxk = np.dot(np.transpose(X[k - 1, fkq, :]), np.conj(X[k - 1, fkq, :])) / Nfkq
+                except Exception as e:
+                    # Catch NaN, Inf, or shape errors
+                    print(f"[RTFsmaskEst2] Warning: bad Rxk at freq {k}, speaker {q}: {e}")
+                    Rxk = np.eye(X.shape[2], dtype=np.complex128)
 
             else:
                 # Rxk = np.cov(X[k - 1, :, :, q].T)
@@ -288,6 +298,113 @@ def RTFsmaskEst2(X, mask, Q, fk):
             H[k - 1, :, q] = Hk / Hk[0]  # Normalize by the first microphone
 
     return H
+
+def beamformer_torch(Xt, mask, fh, Q=CFG.Q, olap=CFG.olap, lens=CFG.lens, a=0.01, fs=CFG.old_fs, att=0.3, b=0.01, calc_istft=False, apply_mask=True):
+    device, (F, T, M) = Xt.device, Xt.shape
+    NFFT = 2 * (F - 1);
+    hop = NFFT - int(olap * NFFT)
+    H = RTFsmaskEst2_torch(Xt, mask, fh, Q=Q)
+    R = compute_R_xt_torch(Xt)
+    Y = lcmv_nonoise_torch(Xt, H, a)
+
+    ym = torch.zeros((lens, Q), dtype=torch.float64, device=device)
+    win = torch.hann_window(NFFT, periodic=True, dtype=torch.float64, device=device)
+    for q in range(Q):
+        if apply_mask:
+            Ym = Y[:, :, q] * ((mask == q) + (mask != q) * att)
+        else:
+            Ym = Y[:, :, q]
+        if calc_istft:
+            yq = torch.istft(Ym.to(torch.complex128), n_fft=NFFT, hop_length=hop,
+                             win_length=NFFT, window=win, center=True, normalized=False,length=lens)
+            ym[:, q] = yq
+    return ym, Y
+
+def RTFsmaskEst2_torch(X, mask, fk, Q=CFG.Q):
+    device = X.device
+    dtype = X.dtype
+    F = X.shape[0]
+    Mics = X.shape[2]
+    H = torch.zeros((F, Mics, Q), dtype=torch.complex128, device=device)
+    for q in range(Q):
+        for k in range(1,F + 1):
+            fkq = torch.where(mask[k - 1, :] == q)[0]
+            Nfkq = fkq.numel()
+            if Nfkq == 0:
+                fkq = fk[q].clone().detach()
+                Nfkq = fkq.numel()
+                # Extract the submatrix [Nfkq, M]
+            X_sel = X[k - 1, fkq, :]  # shape [Nfkq, M]
+            # Covariance
+            Rxk = (X_sel.T @ X_sel.conj()) / Nfkq
+
+            # Eigen decomposition
+            ee, Uk = torch.linalg.eigh(Rxk)
+            # Sort descending
+            ee_ord = torch.argsort(ee, descending=True)
+
+            # Leading eigenvector
+            Hk = Uk[:, ee_ord[0]]
+            H[k - 1, :, q] = Hk / Hk[0]
+    return H
+def compute_R_xt_torch(Xt):
+    F, T, M = Xt.shape
+    device = Xt.device
+
+    # Allocate result
+    R = torch.zeros((M, M, F), dtype=torch.complex128, device=device)
+
+    eyeM = torch.eye(M, dtype=torch.complex128, device=device) * 1e-6
+
+    for f in range(F):
+        Xf = Xt[f]  # [T, M]
+        R[:, :, f] = (Xf.conj().T @ Xf) / T + eyeM
+
+    return R
+def lcmv_nonoise_torch(Xt, H, a, low_bin=25, fs=CFG.old_fs, olap=CFG.olap, lens=CFG.lens):
+    """
+    LCMV beamforming without noise covariance (Torch version equivalent to NumPy lcmv_nonoise).
+    Args:
+        Xt: [K, L, M] complex STFT mixture
+        H: [K, M, Q] RTF estimates
+        a: regularization scalar
+        low_bin: lowest frequency bin to start beamforming (default 25)
+        fs: sampling rate
+        olap: STFT overlap fraction
+        lens: output waveform length
+    Returns:
+        yo [T, Q], Yo [K, L, Q]
+    """
+    device = Xt.device
+    K, L, M = Xt.shape
+    Q = H.shape[2]
+    NFFT = 2 * (K - 1)
+    noverlap = int(olap * NFFT)
+
+    Yo = torch.zeros((K, L, Q), dtype=torch.complex128, device=device)
+    I_Q = torch.eye(Q, dtype=torch.complex128, device=device)
+
+    for q in range(Q):
+        W = torch.zeros((M, K), dtype=torch.complex128, device=device)
+        g = I_Q[:, q]  # one-hot vector
+
+        for k in range(low_bin, K):
+            C = H[k, :, :]  # [M, Q]
+
+            if torch.sum(C.abs()) == 0:
+                # Explicit zero if no RTF
+                W[:, k] = torch.zeros(M, dtype=torch.complex128, device=device)
+            else:
+                temp1 = C.conj().T @ C  # [Q, Q]
+                temp2 = a * torch.linalg.norm(temp1) * torch.eye(Q, dtype=torch.complex128, device=device)
+                temp3 = torch.linalg.pinv(temp1 + temp2)
+                W[:, k] = C @ (temp3 @ g)
+
+            # Yo[k,:,:] = Xt[k,:,:] @ conj(W[:,k])
+            Yo[k, :, q] = Xt[k, :, :] @ W[:, k].conj()
+
+
+    return Yo
 
 
 def MVDR_over_speakers(mixture_stft, target_stft, target_signal, fs, olap, Q=CFG.Q, ref_mic=0, give_target=False):

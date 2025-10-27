@@ -22,11 +22,17 @@ write = False
 data_mode = 'libri'  # or 'wsj0'
 add_noise = 0
 SNR = 20
+
 use_local_deep = True
-plot_flag = False
+combined_flag = False
+GNN_flag = False
+
+
+plot_flag = True
 param_search_flag = False
 param_tries = 40
-loss_plot_flag = True
+loss_plot_flag = False
+save_wavs_flag = True
 
 # === Evaluation & Testing ===
 P_methods = ['vertices', 'prob', 'both']
@@ -34,7 +40,7 @@ P_method = P_methods[1]  # Default to 'prob'
 num_test_runs = 30
 
 # === Signal Duration & Sampling ===
-seconds = 20
+seconds = 5
 SNRs = [20]
 Q = 3 if data_mode != 'wsj0' else 2
 if data_mode == 'wsj0':
@@ -104,18 +110,26 @@ if random_input:
     epochs=1000
 
 # === Local Hyperparameters ===
-RTF_factor = 100
-global_factor = 1000
+RTF_factor = 1e-6
+global_factor = 1e-4
+globalAVG_factor = 1e-2
+
+epochs_local = 200
 
 local_noise_col = False
 use_local_energy_mask = True
 # Local params
 lr_local = 5 * 1e-4
 dim_squeeze = 8
-epochs_local = 400
+
 random_local_input = False
-# RTF_factor = 100
-# global_factor = 10000
+if random_local_input:
+    epochs_local=1000
+
+
+epochs_combined = 1000
+
+
 # num_layers = 5
 # encoder_kernel_size = 5
 # kernel_size = (5, 3)
@@ -132,8 +146,23 @@ encoder_kernel_size = 5
 kernel_size = (3, 3)
 conv_groups = (4, 4)
 
+# === GNN Hyperparameters ===
+hidden_gnn = 128
+batch_gnn = 128
+dropout_gcn = 0.5
+
+hidden_lambda1 = 16
+hidden_lambda2 = 16
+dropout_lambda = 0.0
+
+gnn_lr = 5 * 1e-4
+
+lambda_lr = 5e-4
 
 
+epochs_gnn = 500
+k_neighbours = 10
+K_epochs = 10
 
 # === Frequency and Beamforming ===
 f1 = 1000

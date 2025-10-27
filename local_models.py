@@ -5,7 +5,8 @@ from spatial_net_utils.non_linear import *
 from spatial_net_utils.linear_group import LinearGroup
 from torch.nn import MultiheadAttention
 from functions import *
-
+from torch_geometric.nn import GCNConv
+from torch_geometric.utils import dense_to_sparse, remove_self_loops
 
 
 class SpatialNetLayer(nn.Module):
@@ -219,13 +220,14 @@ class SpatialNet(nn.Module):
             x, attn = l(x)
 
         y = self.decoder(x)
-        y = Functional.softmax(y, dim=-1)
-
         if self.low_energy_mask is not None:
             mask = self.low_energy_mask[None, :, :]  # [1, F, T]
             y = y.clone()
             y[mask, :] = 0
-        return y.contiguous()
+
+        probs = Functional.softmax(y, dim=-1)
+        # y = Functional.softmax(y, dim=-1)
+        return y.contiguous(), probs.contiguous()
 
 
     def initialize_weights_with_xavier(self, seed: int=0):
@@ -244,6 +246,81 @@ class SpatialNet(nn.Module):
                     init.zeros_(m.bias)  # Initialize biases to zero
 
 
+class GCN(nn.Module):
+    def __init__(self, input_adjancy_mat, batch_size=CFG.lenF0, num_nodes=CFG.N_frames, in_feats=(CFG.M - 1) * 2, out_feats=CFG.Q,
+                 hidden=CFG.hidden_gnn, dropout_gcn=CFG.dropout_gcn, seed=1):
+        super().__init__()
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        self.name = 'GCN'
+        self.conv1 = GCNConv(in_feats, hidden)
+        self.conv2 = GCNConv(hidden, hidden)
+        self.conv3 = GCNConv(hidden, out_feats)
+        # self.conv4 = GCNConv(hidden, hidden)
+        # self.fc = GCNConv(hidden, out_feats)
+
+        # self.dropout = nn.Dropout(p=dropout_gcn)
+
+
+        self.B, self.T, self.in_feats, self.J, self.H = batch_size, num_nodes, in_feats, out_feats, hidden
+        self.edge_indexes, self.edge_weights = input_adjancy_mat
+        # self.initialize_weights_with_xavier(seed=seed)
+
+
+    def forward(self, x, temp_A=None):
+        x_flat = x.reshape(self.B * self.T, self.in_feats)
+        x_flat = self.conv1(x_flat, edge_index=self.edge_indexes, edge_weight=self.edge_weights)
+        x_flat = torch.relu(x_flat)
+        x_flat = self.conv2(x_flat, edge_index=self.edge_indexes, edge_weight=self.edge_weights)
+        x_flat = torch.relu(x_flat)
+        x_flat = self.conv3(x_flat, edge_index=self.edge_indexes, edge_weight=self.edge_weights)
+        x_flat = torch.relu(x_flat)
+        # x_flat = self.conv4(x_flat, edge_index=self.edge_indexes, edge_weight=self.edge_weights)
+        # x_flat = self.fc(x_flat, edge_index=self.edge_indexes, edge_weight=self.edge_weights)
+        y = x_flat.view(self.B, self.T, -1).unsqueeze(0)
+        return y, torch.softmax(y, dim=-1)
+
+
+
+class Lambda_MLP(nn.Module):
+    def __init__(self, n_losses_feats=2, h1=CFG.hidden_lambda1, h2=CFG.hidden_lambda2, dropout=CFG.dropout_lambda):
+        super().__init__()
+        self.fc1 = nn.Linear(in_features=n_losses_feats, out_features=h1)
+        self.fc2 = nn.Linear(in_features=h1, out_features=h2)
+        self.fc3 = nn.Linear(in_features=h2, out_features=1)
+        self.dropout = nn.Dropout(p=dropout)
+
+    def forward(self, l1, l2):
+        F, T = l1.shape
+        l1_flat = l1.reshape(-1, 1)
+        l2_flat = l2.reshape(-1, 1)
+        x = torch.cat([l1_flat, l2_flat], dim=-1)
+
+        x = self.fc1(x)
+        x = torch.relu(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        x = torch.relu(x)
+        x = self.dropout(x)
+        x = self.fc3(x)
+        lam = x.view(F, T)
+
+        return torch.sigmoid(lam)
+
+
+def calc_pseudo_labels(noisy_labels, A, H_features, B, T, J, eps=1e-6, K=CFG.K_epochs):
+    if noisy_labels.shape == 2:
+        noisy_labels = noisy_labels.unsqueeze(0).expand(B, -1, -1) ## Get it to shape B, T, J
+
+    H_dist = torch.exp(-torch.cdist(H_features, H_features, p=2))
+
+    W = A / (H_dist + eps)
+    D = W.sum(dim=1)
+    D_inv_sqrt = torch.diag_embed(torch.pow(D + eps, -0.5))
+    S = torch.bmm(torch.bmm(D_inv_sqrt, W), D_inv_sqrt)
+    for k in range(K):
+        noisy_labels = torch.bmm(S, noisy_labels)
+    return noisy_labels
 
 if __name__=="__main__":
 

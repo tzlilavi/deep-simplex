@@ -3,10 +3,10 @@ import random
 import time
 
 import numpy as np
+import matplotlib.pyplot as plt
 import pandas as pd
 import torch
 from tqdm import tqdm
-
 import CFG
 from CFG import use_local_deep
 
@@ -17,10 +17,10 @@ from data_simulator import (
 from functions import (
     calc_needed_audio_scores, calculate_SPA_simplex, calculate_W_U_realSimplex,
     feature_extraction, find_top_active_indices, local_mapping,
-    plot_heat_mat, plot_results, plot_simplex
+    plot_heat_mat, plot_results, plot_simplex, plot_avg_correlation_matrices
 )
 
-from unsupervised import deep_local_masking, global_method
+from unsupervised import deep_local_masking, global_method, run_combined_model, GNN_local_masking, GNN_cleaner_masking
 
 
 random.seed(CFG.seed0)
@@ -161,7 +161,7 @@ def run_pipeline(
             noise_col=CFG.noise_col, add_noise=CFG.add_noise,
         )
         print(f"Probabilistic model ran in {time.time() - start_time:.2f} seconds")
-        plot_results(P2, pr2, pe, id0, J=J, t=t, plot_flag=True, noise_P=deep_dict_global2['P_noise'])
+        plot_results(P2, pr2, pe, id0, J=J, t=t, plot_flag=CFG.plot_flag, noise_P=deep_dict_global2['P_noise'])
 
         # plot3d_simplex(pr2, top_indices, title='pr2 with Amodel top vertices Simplex', azim=30, elev=30)
     else:
@@ -177,58 +177,73 @@ def run_pipeline(
             noise_col=CFG.noise_col, add_noise=CFG.add_noise,
         )
         print(f"{P_method} model ran in {time.time() - start_time:.2f} seconds")
-        plot_results(P, pr2, pe, id0, J=J, t=t, plot_flag=True, noise_P=deep_dict_global['P_noise'])
+        plot_results(P, pr2, pe, id0, J=J, t=t, plot_flag=CFG.plot_flag, noise_P=deep_dict_global['P_noise'])
 
     # --- Local mask standard estimation ---
 
-    fh2, fh22, fh2_pe, fh = find_top_active_indices(pe, P, P2, pr2, P_method=P_method, add_noise=CFG.add_noise)
 
-    Emask, Emask2, Emask_pe = local_mapping(
+
+    Emask, Emask2, Emask_pe, soft_Emask = local_mapping(
         pe, P, P2, pr2, Hlf, Xt, low_energy_mask, J, f, t,
         P_method, deep_dict_global['model_name'], Tmask, add_noise=add_noise, plot_Emask=False
     )
 
 
     # --- Run deep local masking if enabled ---
+    Hlf = Hlf.real
     deep_mask_hard = None
     deep_mask_hard2 = None
-
     if use_local_deep:
-        if P_method == 'both':
-            deep_dict_local, _, deep_mask_hard = deep_local_masking(
-                Xt, P, Hlf, Tmask, Emask=Emask, P_method='vertices', plot_mask=True
+
+        if CFG.combined_flag:
+            P2, _, deep_mask_soft, deep_mask_hard, _ = run_combined_model(W_torch, torch.from_numpy(Hlf), torch.from_numpy(P), low_energy_mask_time, low_energy_mask,
+                                                                          pr2, Tmask, first_non0=first_non0, plot_mask=CFG.plot_flag,
+                                                                    num_epochs=CFG.epochs_combined, lr=CFG.lr, pe=pe, J=J, f=f, t=t,
+                           max_norm=CFG.clip_grad_max, betas=(0.9, 0.999), Emask=Emask, soft_Emask=soft_Emask, P_method='prob')
+            plot_results(P, pr2, P2, id0, J=J, t=t, plot_flag=CFG.plot_flag, third_title='Combined model (local + global)')
+
+        elif CFG.GNN_flag:
+            # deep_dict_local, deep_mask_soft, deep_mask_hard, local_loss_name = GNN_local_masking(
+            #     Xt, P, Hlf, Tmask, Emask=Emask, soft_Emask=soft_Emask, P_method=P_method, J=J,
+            #     plot_mask=CFG.plot_flag, low_energy_mask=low_energy_mask)
+            deep_dict_local, deep_mask_soft, deep_mask_hard, local_loss_name = GNN_cleaner_masking(
+                Xt, P, Hlf, Tmask, Emask=Emask, soft_Emask=soft_Emask, P_method=P_method, J=J,
+                plot_mask=CFG.plot_flag, low_energy_mask=low_energy_mask)
+
+        elif P_method == 'both':
+            deep_dict_local, deep_mask_soft, deep_mask_hard, local_loss_name = deep_local_masking(
+                Xt, P, Hlf, Tmask, Emask=Emask, P_method='vertices', plot_mask=CFG.plot_flag
             )
-            deep_dict_local2, _, deep_mask_hard2 = deep_local_masking(
-                Xt, P2, Hlf, Tmask, Emask=Emask2, P_method='prob', plot_mask=True
+            deep_dict_local2, deep_mask_soft2, deep_mask_hard2, local_loss_name = deep_local_masking(
+                Xt, P2, Hlf, Tmask, Emask=Emask2, P_method='prob', plot_mask=CFG.plot_flag
             )
         else:
-            deep_dict_local, _, deep_mask_hard = deep_local_masking(
-                Xt, P, Hlf, Tmask, Emask=Emask, P_method=P_method,
-                plot_mask=True, low_energy_mask=low_energy_mask
+            deep_dict_local, deep_mask_soft, deep_mask_hard, local_loss_name = deep_local_masking(
+                Xt, P, Hlf, Tmask, Emask=Emask, soft_Emask=soft_Emask, P_method=P_method,
+                plot_mask=CFG.plot_flag, low_energy_mask=low_energy_mask
             )
 
 
-    if use_local_deep:
-        if P_method == 'both':
-            deep_dict_local, _, deep_mask_hard = deep_local_masking(Xt, P, Hlf, Tmask, Emask=Emask, P_method='vertices',
-                                                                    plot_mask=True)
-            deep_dict_local2, _, deep_mask_hard2 = deep_local_masking(Xt, P2, Hlf, Tmask, Emask=Emask2, P_method='prob',
-                                                                      plot_mask=True)
-        else:
-            deep_dict_local, _, deep_mask_hard = deep_local_masking(
-                Xt, P, Hlf, Tmask, Emask=Emask, P_method=P_method, plot_mask=True, low_energy_mask=low_energy_mask
-            )
+        plot_avg_correlation_matrices([Hlf, Tmask, deep_mask_hard, Emask.astype(int)], ['Hlf', 'Tmask', 'Deep_mask', 'Emask'],
+                                      plot_flag=CFG.plot_flag)
+
+
 
     # --- Build list of mask strategies to evaluate ---
     dict_list = []
     show_best_global = False
 
-    if P_method == 'both':
+    fh2, fh22, fh2_pe, fh = find_top_active_indices(pe, P, P2, pr2, P_method=P_method, add_noise=CFG.add_noise)
+
+    if P_method == 'both' or CFG.combined_flag:
         dict_list.extend([
             {'P': P, 'local_mask': Emask, 'P_method': 'vertices', 'local_method': 'NN', 'fh2': fh2},
             {'P': P2, 'local_mask': Emask2, 'P_method': 'prob', 'local_method': 'NN', 'fh2': fh22},
         ])
-        show_best_global = True
+        if CFG.combined_flag:
+            dict_list[0]['P_method'] = 'prob'
+            dict_list[1]['local_method'] = 'SpatialNet'
+            dict_list[1]['local_mask'] = deep_mask_hard
     else:
         dict_list.append({
             'P': P, 'local_mask': Emask, 'P_method': P_method, 'local_method': 'NN', 'fh2': fh2
@@ -236,22 +251,28 @@ def run_pipeline(
         if use_local_deep and deep_mask_hard is not None:
             dict_list.append({
                 'P': P, 'local_mask': deep_mask_hard, 'P_method': P_method,
-                'local_method': 'SpatialNet', 'fh2': fh2
+                'local_method': 'SpatialNet' + local_loss_name, 'fh2': fh2
             })
     dict_list.append({
         'P': pe, 'local_mask': Emask_pe, 'P_method': 'SPA', 'local_method': 'NN', 'fh2': fh2_pe
     })
-
+    dict_list.append({
+        'P': P, 'local_mask': deep_dict_local['P_signals_mask'], 'P_method': P_method,
+        'local_method': 'P_mask', 'fh2': deep_dict_local['P_signals_fh'], 'P_signals': deep_dict_local['P_signals']
+    })
+    save_wavs_flag = CFG.save_wavs_flag
+    if run_number>1:
+        save_wavs_flag = False
     scores = calc_needed_audio_scores(
         dict_list, pr2, fh, Tmask, Hl, Xt, Hq, Xq, xqf, J=J,
-        show_best_local=False, show_best_global=show_best_global, print_scores=True
+        show_best_local=False, show_best_global=show_best_global, print_scores=True, save_wavs=save_wavs_flag
     )
     data_dict = {
         'W': W, 'U': E0, 'pr2': pr2, 'ext0': ext0, 'id0': id0,
         'pe': pe, 'P': P, 'A': A, 'deep_dict_global': deep_dict_global,
         'speakers': speakers, 'combined_data': combined_data
     }
-    return (data_dict, scores, overlap_ratio)
+    return (data_dict, scores, overlap_ratio, 'SpatialNet' + local_loss_name)
 
 
 def comparing_wins(wins_over_comparison_dict, scores, comparing_suff1, comparing_suff2):
@@ -417,7 +438,7 @@ def run_scenario(J, num_test_runs=30, overlap_demand=None, rev=CFG.low_rev, sign
 
     # --- Main experiment loop ---
     for i in tqdm(range(num_test_runs)):
-        data_dict, scores, overlap_ratio = run_pipeline(
+        data_dict, scores, overlap_ratio, local_method = run_pipeline(
             previous_combinations,
             run_number=i + 1,
             J=J,
@@ -445,11 +466,12 @@ def run_scenario(J, num_test_runs=30, overlap_demand=None, rev=CFG.low_rev, sign
     if CFG.P_method == 'both':
         comparison_pairs = [('prob_NN', 'vertices_NN'), ('prob_NN', 'SPA_NN')]
         method_suffixes = ["ideal", "prob_NN", "vertices_NN", "best_global_NN", "SPA_NN"]
-    else:
-        comparison_pairs = [('prob_NN', 'SPA_NN'), ('prob_SpatialNet', 'prob_NN')]
+    elif CFG.P_method =='prob':
+        comparison_pairs = [('prob_NN', 'SPA_NN'), (f'prob_{local_method}', 'prob_NN')]
         method_suffixes = ["ideal", f"{CFG.P_method}_NN", "SPA_NN"]
-        if CFG.use_local_deep:
-            method_suffixes.append(f"{CFG.P_method}_SpatialNet")
+        if CFG.use_local_deep or CFG.combined_flag:
+            method_suffixes.append(f"{CFG.P_method}_{local_method}")
+
 
     comparison_table = compute_comparison_table(
         results, num_test_runs, comparison_pairs, method_suffixes=method_suffixes
@@ -488,7 +510,7 @@ if __name__ == "__main__":
     speaker_nums = [3,2]
     revs = [CFG.low_rev, CFG.high_rev]
     overlaps = [1, 0.5]
-    num_exps = 30
+    num_exps = CFG.num_test_runs
 
     # for J in speaker_nums:
     #     for rev in revs:

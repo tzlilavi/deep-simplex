@@ -3,20 +3,24 @@ import random
 
 import joblib
 import numpy as np
+import matplotlib.pyplot as plt
 import optuna
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as Functional
 import torch.optim as optim
 from torch.optim.lr_scheduler import StepLR
+from torch.func import functional_call
 from tqdm import tqdm
 
 import CFG
-from local_models import SpatialNet
+from local_models import SpatialNet, GCN, Lambda_MLP
 from global_models import BiLSTM_Att, MiSiCNet2, AutoEncoder
-from custom_losses import LocalLoss, SupervisedLoss, Unsupervised_Loss, find_best_permutation_supervised
-from functions import audio_scores, local_mapping, plot_masks, throwlow
+from custom_losses import (LocalLoss, SupervisedLoss, Unsupervised_Loss, find_best_permutation_supervised, CombinedLoss, GNNLoss, GNNLoss_cleaner,
+                           find_best_permutation_supervised_local)
+from functions import audio_scores, local_mapping, plot_masks, throwlow, local_mapping, plot_adjacency_matrices, plot_mask_speakers
+from torch_geometric.utils import to_undirected
 
 torch.manual_seed(42)
 
@@ -184,7 +188,8 @@ def global_method(input_mat, W_torch, first_non0, pr2, low_energy_mask_time, J=C
     return deep_dict, P, A
 
 
-def run_local_model(model, P, R, loss_function, num_epochs=CFG.epochs_local, lr=CFG.lr_local, max_norm=CFG.clip_grad_max, betas=CFG.betas, param_search=CFG.param_search_flag, plot_loss=False):
+def run_local_model(model, P, R, loss_function, num_epochs=CFG.epochs_local, lr=CFG.lr_local, max_norm=CFG.clip_grad_max, betas=CFG.betas,
+                    param_search=CFG.param_search_flag, plot_loss=False):
     """
         Train the local model to predict soft masks from RTF pre frequency (Hlf) and global P.
 
@@ -202,8 +207,10 @@ def run_local_model(model, P, R, loss_function, num_epochs=CFG.epochs_local, lr=
     optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=CFG.weight_decay, betas=betas)
     scheduler = StepLR(optimizer, step_size=15, gamma=0.8)
 
-
+    F, T, C = R.shape
+    _, J = P.shape
     P = P.to(CFG.device)
+    expanded_P = P.expand(F, T, J)
     R = R.real.float().to(CFG.device)
 
     if CFG.random_local_input:
@@ -223,10 +230,11 @@ def run_local_model(model, P, R, loss_function, num_epochs=CFG.epochs_local, lr=
 
         model.train()
 
-        mask_output = model(input)
+        _, mask_output = model(input)
 
 
-        loss, loss_1, loss_2 = loss_function(mask_output, R=R.unsqueeze(0), P=P.unsqueeze(0))
+        loss = loss_function(mask_output, R=R.unsqueeze(0), P=P.unsqueeze(0), expanded_P=expanded_P.unsqueeze(0),
+                            epoch=epoch)
 
 
         optimizer.zero_grad()
@@ -239,12 +247,6 @@ def run_local_model(model, P, R, loss_function, num_epochs=CFG.epochs_local, lr=
         scheduler.step()
 
 
-        if not param_search:
-            if epoch % 10 == 0:
-                print(f"Epoch {epoch + 1}/{num_epochs}, Loss: {loss.item()}, RTF_loss: {loss_1.item()},"
-                      f" global_loss: {loss_2.item()}")
-
-
         if best_loss > loss:
             best_loss = loss
             patience_counter = 0
@@ -254,6 +256,7 @@ def run_local_model(model, P, R, loss_function, num_epochs=CFG.epochs_local, lr=
                 print(f"Early stopping at epoch {epoch}")
                 break
     model.eval()
+    _, mask_output = model(input)
 
     if plot_loss:
         loss_function.plot_loss()
@@ -266,11 +269,12 @@ def run_local_model(model, P, R, loss_function, num_epochs=CFG.epochs_local, lr=
     d['loss'] = round(loss.item(), 4)
     # d['early_loss'] = round(early_loss, 4)
     d['deep_mask'] = mask_output.detach()
-
-
+    d['P_signals'] = loss_function.y_P.detach().cpu()
+    d['P_signals_fh'] = loss_function.fh_p
+    d['P_signals_mask'] = loss_function.P_mask.detach().cpu().numpy()
     return d
 
-def deep_local_masking(Xt, P, Hlf, Tmask, Emask=None, P_method=CFG.P_method, J=CFG.Q, plot_mask=False, plot_loss=False, lr=CFG.lr_local, betas=CFG.betas, RTF_factor=CFG.RTF_factor, global_factor=CFG.global_factor, epochs=CFG.epochs_local,
+def deep_local_masking(Xt, P, Hlf, Tmask, Emask=None, soft_Emask=None, P_method=CFG.P_method, J=CFG.Q, plot_mask=False, plot_loss=False, lr=CFG.lr_local, betas=CFG.betas, RTF_factor=CFG.RTF_factor, global_factor=CFG.global_factor, epochs=CFG.epochs_local,
                        num_layers=CFG.num_layers, dim_squeeze=CFG.dim_squeeze, encoder_kernel_size=CFG.encoder_kernel_size, kernel_size=CFG.kernel_size, conv_groups=CFG.conv_groups,
                        param_search=CFG.param_search_flag, local_init_seed=CFG.local_init_seed, low_energy_mask=None):
     """
@@ -282,10 +286,18 @@ def deep_local_masking(Xt, P, Hlf, Tmask, Emask=None, P_method=CFG.P_method, J=C
             - np.ndarray: Hard mask [L] with speaker labels.
     """
     print("Running Deep Local Mapping...")
-    local_loss = LocalLoss(RTF_factor=RTF_factor, global_factor=global_factor).to(CFG.device)
+    Emask_onehot = torch.zeros((1, CFG.lenF0, CFG.N_frames, J + 1), device=CFG.device)
+    Emask_onehot[0, np.arange(CFG.lenF0)[:, None], np.arange(CFG.N_frames), torch.from_numpy(Emask).long()] = 1
+    if soft_Emask is not None:
+        soft_Emask = torch.from_numpy(soft_Emask).float().to(CFG.device).unsqueeze(0)
+    Xt = torch.from_numpy(Xt).to(CFG.device).unsqueeze(0)
+    P = torch.from_numpy(P).to(CFG.device)
+    local_loss = LocalLoss(RTF_factor=RTF_factor, global_factor=global_factor, Emask=Emask_onehot, soft_Emask=soft_Emask,
+                           P=P, Xt=Xt, loss_names=['BF', 'RTF', 'globalAVG', 'global'], low_energy_mask=low_energy_mask).to(CFG.device)
     local_model = SpatialNet(num_layers=num_layers, dim_squeeze=dim_squeeze, encoder_kernel_size=encoder_kernel_size,
                              kernel_size=kernel_size, conv_groups=conv_groups, seed=local_init_seed, low_energy_mask=low_energy_mask).to(CFG.device)
-    deep_dict_local = run_local_model(local_model, torch.from_numpy(P), torch.from_numpy(Hlf), local_loss, lr=lr, betas=betas, plot_loss=plot_loss, param_search=param_search)
+    deep_dict_local = run_local_model(local_model, P, torch.from_numpy(Hlf), local_loss, lr=lr, betas=betas, plot_loss=plot_loss,
+                                      param_search=param_search)
 
     deep_mask_soft = deep_dict_local['deep_mask'].squeeze(0).detach().cpu().numpy()
     deep_mask_hard = deep_mask_soft.argmax(axis=-1)
@@ -295,193 +307,416 @@ def deep_local_masking(Xt, P, Hlf, Tmask, Emask=None, P_method=CFG.P_method, J=C
     if plot_mask:
         plot_masks(Tmask, deep_mask_hard, Emask, P_method=P_method)
 
-    return deep_dict_local, deep_mask_soft, deep_mask_hard
+    return deep_dict_local, deep_mask_soft, deep_mask_hard, local_loss.name
 
-def load_all_dicts(folder_path="array_data"):
-    """Load all .pkl files and return a list of dictionaries."""
-    all_files = sorted([f for f in os.listdir(folder_path) if f.endswith(".pkl")])
-    return [joblib.load(os.path.join(folder_path, f)) for f in all_files]
+def run_combined_model(W_torch, Hlf, P_global_final, low_energy_mask_time, low_energy_mask, pr2, Tmask, first_non0=0, num_epochs=CFG.epochs_combined, lr=CFG.lr,
+                       max_norm=CFG.clip_grad_max, betas=(0.9, 0.999), Emask=None, soft_Emask=None, P_method=CFG.P_method, pe=None,
+                       t=None, f=None, J=CFG.Q, Xt=None,
+                       plot_mask=False):
+
+    dim_output = J + 1 if CFG.noise_col else J
+
+    global_model = BiLSTM_Att(dim_output=dim_output, P_method=P_method, n_repeat_last_lstm=CFG.n_repeat_last_lstm,
+                              n_heads=CFG.n_heads, seed=CFG.global_seed, low_energy_mask=low_energy_mask_time,
+                              dropout=CFG.dropout).to(CFG.device)
+
+    local_model = SpatialNet(num_layers=CFG.num_layers, dim_squeeze=CFG.dim_squeeze, encoder_kernel_size=CFG.encoder_kernel_size,
+                             kernel_size=CFG.kernel_size, conv_groups=CFG.conv_groups, seed=CFG.local_init_seed,
+                             low_energy_mask=low_energy_mask).to(CFG.device)
+
+    Emask_onehot = torch.zeros((1, CFG.lenF0, CFG.N_frames, J + 1), device=CFG.device)
+    Emask_onehot[0, np.arange(CFG.lenF0)[:, None], np.arange(CFG.N_frames), torch.from_numpy(Emask).long()] = 1
+    if soft_Emask is not None:
+        soft_Emask = torch.from_numpy(soft_Emask).float().to(CFG.device).unsqueeze(0)
+    combined_loss = CombinedLoss(F=CFG.lenF0, T=CFG.N_frames, C=(CFG.M - 1) * 2, J=CFG.Q, RTF_factor=CFG.RTF_factor,
+                                 Emask=Emask_onehot, soft_Emask=soft_Emask, global_factor=CFG.global_factor,
+                                 globalAVG_factor=CFG.globalAVG_factor, weight_decay=CFG.weight_decay,
+                                 epochs=num_epochs, first_non0=first_non0, SAD_factor=CFG.SAD_factor,
+                                 L2_factor=CFG.L2_factor, P_method=P_method, input_mask=None,
+                                 noise_col=CFG.noise_col, noise_col_weight=CFG.noise_col_weight).to(CFG.device)
+
+    optimizer = optim.Adam(list(global_model.parameters()) + list(local_model.parameters()),
+                           lr=lr, weight_decay=CFG.weight_decay, betas=betas)
+    scheduler = StepLR(optimizer, step_size=15, gamma=0.8)
+
+    W_torch = W_torch.to(CFG.device)
+    Hlf = Hlf.unsqueeze(0).real.float().to(CFG.device)
+
+    best_loss = float('inf')
+    patience = 30
+    patience_counter = 0
+
+    for epoch in range(num_epochs):
+        global_model.train(); local_model.train()
+        P_output, W_output, E_output, A_output = global_model(W_torch, epoch)
+        mask_output = local_model(Hlf)
+        loss, loss_global, loss_local = combined_loss(mask_output, Hlf, W_torch, P_output, epoch=epoch)
+
+        optimizer.zero_grad()
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(list(global_model.parameters()) + list(local_model.parameters()), max_norm)
+        optimizer.step(); scheduler.step()
+
+        if loss.item() < best_loss:
+            best_loss = loss.item(); patience_counter = 0
+        else:
+            patience_counter += 1;
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch + 1}")
+            break
+
+    global_model.eval(); local_model.eval()
+    with torch.no_grad():
+        P_output, _, _, A_output = global_model(W_torch)
+        mask_output = local_model(Hlf)
 
 
-def objective_local(trial):
-    """Objective function for Optuna hyperparameter tuning."""
-    # Define hyperparameter search space
-    seed = trial.suggest_int("seed", 0, 9999)
-    lr_local = trial.suggest_categorical("lr_local", [5 * 1e-5, 5 * 1e-4, 5 * 1e-3, 5 * 1e-2, 5 * 1e-1])
-    RTF_factor = trial.suggest_categorical("RTF_factor", [10, 100, 1000, 10000])
-    global_factor = trial.suggest_categorical("global_factor", [100, 1000, 10000, 100000])
-    num_layers = trial.suggest_categorical("num_layers", [3, 5, 7, 9])
-    encoder_kernel_size = trial.suggest_categorical("encoder_kernel_size", [3, 5])
-    kernel_size_options = [(5, 3), (3, 3), (5, 5), (3, 5)]
-    conv_groups_options = [(8, 8), (6, 6), (4, 4), (2, 2)]
-    kernel_size = trial.suggest_categorical("kernel_size", [str(k) for k in kernel_size_options])
-    conv_groups = trial.suggest_categorical("conv_groups", [str(c) for c in conv_groups_options])
-    kernel_size = eval(kernel_size)
-    conv_groups = eval(conv_groups)
+    loss_function_global = SupervisedLoss(L2_factor=CFG.L2_factor, SAD_factor=CFG.SAD_factor)
+    _, P_output, best_permutation, _, _ = find_best_permutation_supervised(loss_function_global, P_output.detach(),
+                                                                    torch.from_numpy(pr2).unsqueeze(0).float().to(CFG.device))
 
-    # Fixed parameters
-    epochs_local = 100
-    dim_squeeze = 8  # Always fixed
+    Tmask_onehot = torch.zeros((1, CFG.lenF0, CFG.N_frames, J + 1), device=CFG.device)
+    Tmask_onehot[0, np.arange(CFG.lenF0)[:, None], np.arange(CFG.N_frames), torch.from_numpy(Tmask).long()] = 1
+    _, mask_output, best_permutation_mask = find_best_permutation_supervised_local(mask_output, Tmask_onehot[:, :, :, :-1])
 
-    # Load all datasets and randomly select 10
-    all_dicts = load_all_dicts('array_data_global_tuning_full')
-    selected_dicts = random.sample(all_dicts, 5)
 
-    sisdr_scores = []
+    # Remove negative values and normalize rows that exceed simplex constraints
+    P_output = P_output.cpu().numpy().squeeze(0)
+    P_output = throwlow(P_output)
+    P_output[P_output.sum(1) > 0, :] = P_output[P_output.sum(1) > 0, :] / P_output[P_output.sum(1) > 0, :].sum(1, keepdims=True)
 
-    for data_dict in tqdm(selected_dicts):
+    deep_mask_soft = mask_output.squeeze(0).detach().cpu().numpy()
+    deep_mask_hard = deep_mask_soft.argmax(axis=-1)
+    # deep_mask_hard, _, _, deep_mask_soft = local_mapping(
+    #     pe, P_output, None, pr2, Hlf.squeeze(0).detach().cpu().numpy(), Xt, low_energy_mask, J, f, t, P_method, 'asd', Tmask)
+    # deep_mask_hard = deep_mask_hard.astype(int)
+    if plot_mask:
+        plot_masks(Tmask, deep_mask_hard, Emask, P_method=P_method)
 
-        # Extract necessary data
-        Xt = data_dict['Xt']
-        P = data_dict['P']
-        Hlf = data_dict['Hlf']
-        pe = data_dict['pe']
-        pr2 = data_dict['SDR_prob']  # Assuming this is the correct key
-        P2 = data_dict['P2']
-        Tmask = data_dict['Tmask']
-        Emask = data_dict['Emask']
-        Emask2 = data_dict['Emask2']
-        Emask_pe = data_dict['Emask_pe']
-        Hl = data_dict['Hlf']
-        Hq = data_dict['Hlf']  # Placeholder, adjust if needed
-        Xq = data_dict['Xq']
-        xqf = data_dict['xqf']
-        fh2 = data_dict['fh2']
-        fh22 = data_dict['fh22']
-        fh2_pe = data_dict['fh2_pe']
+    return P_output, A_output, deep_mask_soft, deep_mask_hard, loss
 
-        # Call deep_local_masking with sampled hyperparameters
-        _, _, deep_mask_hard = deep_local_masking(
-            Xt, P, Hlf, Emask, Tmask,
-            lr=lr_local,
-            RTF_factor=RTF_factor,
-            global_factor=global_factor,
-            epochs=epochs_local,
-            num_layers=num_layers,
-            dim_squeeze=dim_squeeze,
-            encoder_kernel_size=encoder_kernel_size,
-            kernel_size=kernel_size,
-            conv_groups=conv_groups,
-            seed=seed,
-            param_search=True
+
+def calculate_adjancy_mat(feature_mat, Hlf=None, P=None, Tmask=None, k=10, sigma=1.0,
+                          plot_flag=CFG.plot_flag, TH=0.5, method='KNN'):
+
+    F, T, dim_input = feature_mat.shape
+    batch_size = F
+    count = F * T * T
+
+    dist = torch.cdist(feature_mat, feature_mat, p=2)
+
+    A_gauss = torch.exp(-(dist**2) / (2 * (sigma**2)))
+
+    eye = torch.eye(T, dtype=torch.bool).unsqueeze(0)
+    A_gauss = A_gauss.masked_fill(eye, 0)
+
+    if method == 'KNN':
+        vals, idx = A_gauss.topk(k, dim=-1)
+        Kp = idx.shape[-1]
+        expanded_T = (torch.arange(T)).expand(F, T)
+        updated_idx = torch.cat([idx, (expanded_T + 1)[:, :, None], (expanded_T - 1)[:, :, None]], dim=-1)
+        updated_idx = updated_idx.clamp(0, T - 1)
+        updated_vals = torch.cat([vals, A_gauss.gather(-1, updated_idx[:, :, -2:])], dim=-1)
+
+
+        A = torch.zeros_like(A_gauss)
+        A.scatter_(dim=-1, index=updated_idx, src=updated_vals)
+
+        f_idx = torch.arange(F)[:, None, None].expand_as(updated_idx)  # (F,T,Kp)
+        t_idx = torch.arange(T)[None, :, None].expand_as(updated_idx)  # (F,T,Kp)
+
+        src = (f_idx * T + t_idx).reshape(-1)  # (N_edges,)
+        dst = (f_idx * T + updated_idx).reshape(-1)  # (N_edges,)
+        edge_index = torch.stack([src, dst], dim=0)
+
+        edge_weight = updated_vals.reshape(-1)
+
+
+
+    elif method == 'TH':
+        device = A_gauss.device
+        num_nodes = F * T
+
+        mask = A_gauss > TH  # (F,T,T)
+        t = torch.arange(T, device=device)
+        mask[:, t, (t + 1).clamp(0, T - 1)] = True
+        mask[:, t, (t - 1).clamp(0, T - 1)] = True
+        A = A_gauss * mask.float()
+
+        idx = mask.nonzero(as_tuple=False)  # (N,3): [f, i, j]
+        vals = A_gauss[idx[:, 0], idx[:, 1], idx[:, 2]]  # (N,)
+
+        src = idx[:, 0] * T + idx[:, 1]
+        dst = idx[:, 0] * T + idx[:, 2]
+        edge_index = torch.stack([src, dst], dim=0)  # (2, N)
+        edge_weight = vals  # (N,)
+
+        # drop self-loops (can appear at boundaries due to clamp)
+        keep = edge_index[0] != edge_index[1]
+        edge_index = edge_index[:, keep]
+        edge_weight = edge_weight[keep]
+
+        edge_index, edge_weight = to_undirected(edge_index, edge_weight, reduce="mean")
+
+        order = edge_index[0] * num_nodes + edge_index[1]
+        perm = torch.argsort(order)
+        edge_index = edge_index[:, perm]
+        edge_weight = edge_weight[perm]
+
+
+    if plot_flag:
+        A_tmask = (Tmask.unsqueeze(-1) == Tmask.unsqueeze(-2)).float()
+        f = 100
+        plot_adjacency_matrices(
+            [A_tmask[[0, 300, 600, 900], :, :].mean(0).cpu().numpy(),
+             A_gauss[[0, 300, 600, 900], :, :].mean(0).cpu().numpy(),
+             A[[0, 300, 600, 900], :, :].mean(0).cpu().numpy()],
+            ["Real (Tmask)", "Gauss", f"A_>{TH}"],
+            suptitle=f"mean over a few freqs adjacency matrices"
         )
-
-        # Compute SDR score
-        scores = audio_scores(pe, pr2, P2, None, Tmask, deep_mask_hard, None, Emask_pe, Hl, Xt, Hq, Xq, xqf, fh2, None,
-                              fh2_pe,
-                              P_method='prob', calc_SPA_scores=False, print_scores=False)
-        sisdr_prob_NN = scores['sisdr_prob_NN']
-        print(sisdr_prob_NN)
-        sisdr_scores.append(sisdr_prob_NN)
-
-    # Return mean SDR as the metric to maximize
-    return np.mean(sisdr_scores)
-
-def objective_global(trial):
-    """Objective function for Optuna hyperparameter tuning."""
-
-    # Define hyperparameter search space
-    seed = trial.suggest_int("seed", 0, 9999)
-    lr = trial.suggest_categorical("lr", [5 * 1e-5, 5 * 1e-4, 5 * 1e-3, 5 * 1e-2, 5 * 1e-1])
-    SAD_factor = trial.suggest_categorical("SAD_factor", [10, 100, 1000, 10000])
-    L2_factor = trial.suggest_categorical("L2_factor", [100, 1000, 10000, 100000])
-    n_heads = trial.suggest_categorical("n_heads", [4,8,12])
-    n_repeat_last_lstm = trial.suggest_categorical("n_repeat_last_lstm", [1,2,3])
-    betas_options = [(0.9, 0.999), (0.85, 0.98), (0.5, 0.99), (0.9, 0.95)]
-    betas = trial.suggest_categorical("betas", [str(k) for k in betas_options])
-    betas = eval(betas)
-    # Fixed parameters
-    epochs_local = 100
+    return edge_index, edge_weight, A_gauss, A
 
 
-    # Load all datasets and randomly select 10
-    all_dicts = load_all_dicts('array_data_global_tuning_full')
-    selected_dicts = random.sample(all_dicts, 15)
 
-    sisdr_scores = []
 
-    for data_dict in tqdm(selected_dicts):
+def GNN_local_masking(Xt, P, Hlf, Tmask, Emask=None, soft_Emask=None, P_method=CFG.P_method, J=CFG.Q, plot_mask=False, plot_loss=False, gnn_lr=CFG.gnn_lr, lambda_lr=CFG.lambda_lr,
+                      betas=CFG.betas, num_epochs=CFG.epochs_gnn, max_norm=CFG.clip_grad_max,
+                       param_search=CFG.param_search_flag, local_init_seed=CFG.local_init_seed, low_energy_mask=None,
+                      hidden_size=CFG.hidden_gnn, batch_size=CFG.batch_gnn):
 
-        # Extract necessary data
-        Xt = data_dict['Xt']
-        P = data_dict['P2']
-        Hlf = data_dict['Hlf']
-        pe = data_dict['pe']
-        pr2 = data_dict['pr2']  # Assuming this is the correct key
-        # P2 = data_dict['P2']
-        Tmask = data_dict['Tmask']
-        Emask = data_dict['Emask']
-        Emask2 = data_dict['Emask2']
-        Emask_pe = data_dict['Emask_pe']
-        Hl = data_dict['Hlf']
-        Hq = data_dict['Hlf']  # Placeholder, adjust if needed
-        Xq = data_dict['Xq']
-        xqf = data_dict['xqf']
-        fh2 = data_dict['fh2']
-        fh22 = data_dict['fh22']
-        fh2_pe = data_dict['fh2_pe']
-        W = data_dict['W']
-        first_non0 = data_dict['first_non0']
-        low_energy_mask = data_dict['low_energy_mask']
-        low_energy_mask_time = data_dict['low_energy_mask_time']
+    print("Running GNN Local Mapping...")
+    Emask_onehot = torch.zeros((1, CFG.lenF0, CFG.N_frames, J + 1), device=CFG.device)
+    Emask_onehot[0, np.arange(CFG.lenF0)[:, None], np.arange(CFG.N_frames), torch.from_numpy(Emask).long()] = 1
+    if soft_Emask is not None:
+        soft_Emask = torch.from_numpy(soft_Emask).float().to(CFG.device)
+    Xt = torch.from_numpy(Xt).to(CFG.device).unsqueeze(0)
+    onehot_Tmask = Functional.one_hot(torch.from_numpy(Tmask), num_classes=J + 1)[:, :, :J]
 
-        # Call deep_local_masking with sampled hyperparameters
-        _, P, _ = global_method(W, first_non0, pr2, low_energy_mask_time, J=CFG.Q, lr=lr, SAD_factor=SAD_factor,
-                  L2_factor=L2_factor, P_method='prob', param_search_flag=True,
-                  epochs=100, betas=betas, n_repeat_last_lstm=n_repeat_last_lstm, n_heads=n_heads, seed=seed)
+    P = torch.from_numpy(P)
+    Hlf = torch.from_numpy(Hlf).real.float()
 
-        Emask, fh2, _, _, _, _ = local_mapping(pe, P, None, Hlf, Xt, low_energy_mask, CFG.Q, None, None,
-                                                                   'prob', 'prob', plot_Emask=False)
 
-        scores = audio_scores(pr2, P, Tmask, Emask,
-                 Hl, Xt, Hq, Xq, xqf, fh2, J=CFG.Q, compute_ideal=False,
-                 P_method='prob', local_method='NN', print_scores=False)
+    F, T, C = Hlf.shape
+    batch_size = F
 
-        sisdr_prob_NN = scores['si-sdr_prob_NN']
-        print(sisdr_prob_NN)
-        sisdr_scores.append(sisdr_prob_NN)
-        if np.mean(sisdr_scores) < 0:
-            return np.mean(sisdr_scores)
+    # feature_mat = torch.cat([Hlf,  P.expand(F, T, J)], dim=-1)
+    # feature_mat = torch.cat([Hlf, soft_Emask.cpu()], dim=-1)
+    feature_mat = Hlf
+    dim_input = feature_mat.shape[-1]
+    edge_idx, edge_weights, A_gauss, A = calculate_adjancy_mat(feature_mat, Tmask=torch.from_numpy(Tmask), k=10, sigma=1,
+                                                                         method='KNN')
 
-        # Return mean SDR as the metric to maximize
-    return np.mean(sisdr_scores)
-def optuna_param_search(n_trials=50, excel_file="optuna_global_results.xlsx"):
-    """Run Optuna to find the best hyperparameters."""
+    edge_idx = edge_idx.to(CFG.device)
+    edge_weights = edge_weights.to(CFG.device)
+    P = P.to(CFG.device)
+    Hlf = Hlf.to(CFG.device)
+    feature_mat = feature_mat.to(CFG.device)
 
-    # Create Optuna study
-    study = optuna.create_study(direction='maximize')  # SDR should be maximized
-    study.optimize(objective_global, n_trials=n_trials)
 
-    # Save results to Excel
-    df_results = pd.DataFrame(study.trials_dataframe())
-    df_results.to_excel(excel_file, index=False)
 
-    # Print best result
-    print("\nBest hyperparameters:", study.best_params)
-    print("Best SI-SDR value:", study.best_value)
+    gnn_model = GCN(input_adjancy_mat=(edge_idx, edge_weights), batch_size=F, num_nodes=T ,in_feats=dim_input, out_feats=J, hidden=hidden_size)
+    gnn_model = gnn_model.to(CFG.device)
 
-    return study.best_params
 
-if __name__ == "__main__":
-    a=5
-    # d_list = load_all_dicts()
-    # d = d_list[0]
-    # model = SpatialNet()
-    # loss_function = LocalLoss()
-    # Xt = d['Xt']
-    # P = d['P']
-    # P2 = d['P2']
-    # pe = d['pe']
-    # Tmask = d['Tmask']
-    # Emask_pe = d['Emask_pe']
-    # fh2 = d['fh2']
-    # fh2_pe = d['fh2_pe']
-    # fh22 = d['fh22']
-    # Xq=d['Xq']
-    # Hlf = d['Hlf']
-    # Emask = d['Emask']
-    # Emask2 = d['Emask2']
-    # deep_dict_local, deep_mask_soft, deep_mask_hard = deep_local_masking(Xt, P2, Hlf, J=CFG.Q, P_method='prob')
-    # plot_masks(Tmask, Emask, 1 - deep_mask_soft[:, :, 0], 'prob')
+    # lambda_model = Lambda_MLP(n_losses_feats=2)
+    # lambda_model = lambda_model.to(CFG.device)
 
-    best_params = optuna_param_search(n_trials=30)
+    loss_function = GNNLoss(F, T, C=dim_input, J=J, Emask=Emask_onehot, epochs=num_epochs,
+                            loss_names=['global', 'globalAVG'])
+
+    optimizer = torch.optim.Adam([{'params': gnn_model.parameters(),   'lr': gnn_lr, 'weight_decay': 5e-4}])
+                                # {'params': lambda_model.parameters(),  'lr': lambda_lr, 'weight_decay': 0.0},])
+    scheduler = StepLR(optimizer, step_size=15, gamma=0.8)
+
+    gnn_model.train()
+    # lambda_model.train()
+
+    patience = 30
+    patience_counter = 0
+    best_loss = float('inf')
+
+    for epoch in range(num_epochs):
+
+        gnn_model.train()
+        out_features, mask_output = gnn_model(feature_mat)
+
+        loss = loss_function(mask_output, P.unsqueeze(0), R=Hlf.unsqueeze(0), epoch=epoch)
+
+        optimizer.zero_grad()
+
+        loss.backward()
+
+        torch.nn.utils.clip_grad_norm_(gnn_model.parameters(), max_norm=max_norm, norm_type=1)
+        optimizer.step()
+
+        scheduler.step()
+
+        if best_loss > loss:
+            best_loss = loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
+    gnn_model.eval()
+    out_features, deep_mask_soft = gnn_model(feature_mat)
+
+
+    deep_mask_soft = deep_mask_soft.squeeze(0).detach().cpu().numpy()
+    deep_mask_hard = deep_mask_soft.argmax(axis=-1)
+
+    deep_mask_hard[low_energy_mask] = J
+
+    if plot_mask:
+        plot_masks(Tmask, deep_mask_hard, Emask, P_method=P_method)
+
+    deep_dict_local = {}
+    return deep_dict_local, deep_mask_soft, deep_mask_hard, loss_function.name
+
+
+def GNN_cleaner_masking(Xt, P, Hlf, Tmask, Emask=None, soft_Emask=None, P_method=CFG.P_method, J=CFG.Q, plot_mask=False, plot_loss=False,
+                        gnn_lr=CFG.gnn_lr, lambda_lr=CFG.lambda_lr, K_epochs=CFG.K_epochs, sigma=1.0, k_top=CFG.k_neighbours,
+                      betas=CFG.betas, num_epochs=CFG.epochs_gnn, max_norm=CFG.clip_grad_max,
+                       param_search=CFG.param_search_flag, local_init_seed=CFG.local_init_seed, low_energy_mask=None,
+                      hidden_size=CFG.hidden_gnn, batch_size=CFG.batch_gnn):
+
+    print("Running GNN Cleaner Local Mapping...")
+    Emask_onehot = torch.zeros((1, CFG.lenF0, CFG.N_frames, J + 1), device=CFG.device)
+    Emask_onehot[0, np.arange(CFG.lenF0)[:, None], np.arange(CFG.N_frames), torch.from_numpy(Emask).long()] = 1
+    if soft_Emask is not None:
+        soft_Emask = torch.from_numpy(soft_Emask).float().to(CFG.device)
+    Xt = torch.from_numpy(Xt).to(CFG.device).unsqueeze(0)
+
+
+    P = torch.from_numpy(P)
+    Hlf = torch.from_numpy(Hlf).real.float()
+
+
+    F, T, C = Hlf.shape
+    batch_size = F
+
+    # feature_mat = torch.cat([Hlf,  P.expand(F, T, J)], dim=-1)
+    # feature_mat = torch.cat([Hlf, soft_Emask.cpu()], dim=-1)
+    feature_mat = Hlf
+    dim_input = feature_mat.shape[-1]
+    edge_idx, edge_weights, A_gauss, A = calculate_adjancy_mat(feature_mat, Tmask=torch.from_numpy(Tmask), k=k_top, sigma=sigma,
+                                                                         method='KNN')
+
+    edge_idx = edge_idx.to(CFG.device)
+    edge_weights = edge_weights.to(CFG.device)
+    P = P.to(CFG.device)
+    Hlf = Hlf.to(CFG.device)
+    feature_mat = feature_mat.to(CFG.device)
+    A = A.to(CFG.device)
+
+
+    # gnn_model = GCN(input_adjancy_mat=(edge_idx, edge_weights), batch_size=F, num_nodes=T ,in_feats=dim_input, out_feats=J, hidden=hidden_size)
+    gnn_model = SpatialNet(num_layers=CFG.num_layers, dim_squeeze=CFG.dim_squeeze,
+                             encoder_kernel_size=CFG.encoder_kernel_size,
+                             kernel_size=CFG.kernel_size, conv_groups=CFG.conv_groups, seed=CFG.local_init_seed,
+                             low_energy_mask=low_energy_mask).to(CFG.device)
+    gnn_model = gnn_model.to(CFG.device)
+
+    lambda_model = Lambda_MLP(n_losses_feats=2)
+    lambda_model = lambda_model.to(CFG.device)
+
+
+    loss_function = GNNLoss_cleaner(F, T, C=dim_input, J=J, Emask=Emask_onehot, epochs=num_epochs, loss_names=['global', 'globalAVG', 'RTF'])
+
+
+
+    optimizer = torch.optim.Adam([{'params': gnn_model.parameters(),   'lr': gnn_lr, 'weight_decay': 5e-4},
+                                {'params': lambda_model.parameters(),  'lr': lambda_lr, 'weight_decay': 5e-4},])
+    scheduler = StepLR(optimizer, step_size=15, gamma=0.8)
+
+    gnn_model.train()
+    lambda_model.train()
+
+    patience = 30
+    patience_counter = 0
+    best_loss = float('inf')
+    inner_lr = 1e-4
+    expanded_P = P.expand(F, T, J)
+    for epoch in range(num_epochs):
+
+        out_features, mask_output = gnn_model(feature_mat)  # h, y_hat
+
+        # 1. run label propagation
+        with torch.no_grad():
+            Y_pseudo = label_propagation(out_features, A, K_epochs, soft_Emask, soft_Emask=soft_Emask, epoch=epoch)  # [F, T, J]
+            Y_pseudo = Y_pseudo / (Y_pseudo.sum(dim=-1, keepdim=True) + 1e-10)
+        # 2. compute per-node losses
+        # loss1 = Functional.mse_loss(mask_output.squeeze(), Y_pseudo)
+        # loss2 = Functional.mse_loss(mask_output.squeeze(), expanded_P)
+
+
+        # loss1 = -(Y_pseudo * torch.log(mask_output.squeeze() + 1e-10)).sum(-1)
+        # loss1 = Functional.kl_div(mask_output.log(), Y_pseudo, reduction="batchmean")
+        loss1 = loss_function(mask_output, P.unsqueeze(0), R=Hlf.unsqueeze(0), epoch=epoch).squeeze()
+        loss2 = Functional.kl_div(mask_output.log(), Y_pseudo, reduction="none").squeeze().sum(-1)
+
+        # loss2 = -(expanded_P * torch.log(mask_output.squeeze() + 1e-10)).sum()
+        # loss1 = -(P.unsqueeze(0) * torch.log(mask_output.mean(dim=1) + 1e-10)).sum(dim=(1, 2))
+
+
+
+        lambda_output = lambda_model(loss1, loss2)  # [F, T]
+        #
+        # # 4. corrected labels
+        Y_output = lambda_output[:, :, None] * P[None, :, :] + (1 - lambda_output[:, :, None]) * Y_pseudo  # [F, T, J]
+        #
+
+        # L_tr = loss1.mean() + loss2.mean()
+        L_tr = Functional.kl_div(mask_output.log(), Y_output, reduction="batchmean").squeeze().sum(-1)
+        optimizer.zero_grad()
+        L_tr.backward()
+        optimizer.step()
+        scheduler.step()
+
+        if epoch % 10 == 0:
+            print(f"Epoch {epoch + 1}/{num_epochs}, l1(mask_out,Y_pseudo): {loss1.mean().item():.4f}, l2(mask_out,P): {loss2.mean().item():.4f}, L_tr(mask_out,Y_out): {L_tr.item():.4f}")
+
+        if best_loss > L_tr:
+            best_loss = L_tr
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
+
+    gnn_model.eval()
+    out_features, deep_mask_soft = gnn_model(feature_mat)
+
+
+    deep_mask_soft = deep_mask_soft.squeeze(0).detach().cpu().numpy()
+    deep_mask_hard = deep_mask_soft.argmax(axis=-1)
+
+    deep_mask_hard[low_energy_mask] = J
+
+    if plot_mask:
+        plot_masks(Tmask, deep_mask_hard, Emask, P_method=P_method)
+
+    deep_dict_local = {}
+    return deep_dict_local, deep_mask_soft, deep_mask_hard, 'GNN_cleaner'
+
+def label_propagation(out_features, A, K_epochs, noisy_Y=None, soft_Emask=None, epoch=None):
+    out_features = out_features.squeeze(0)
+    F, T, J = out_features.shape
+    Y = noisy_Y
+
+    # dist = torch.cdist(out_features, out_features, p=2)
+    W = A #/ (dist + 1e-10)
+
+    for k in range(K_epochs):
+        d = W.sum(-1) + 1e-6
+        d_inv_sqrt = torch.rsqrt(d)
+        S = d_inv_sqrt[:, :, None] * W * d_inv_sqrt[:, None, :]
+
+        Y = torch.bmm(S, Y)
+    if CFG.plot_flag and epoch % 100 == 0:
+        plot_mask_speakers([soft_Emask, Y], ['Emask', 'Pseudo_Y'], title=f'epoch={epoch}')
+    return Y
+

@@ -13,6 +13,6 @@ torch==2.5.1
 torchaudio==2.5.1
 torchmetrics==1.6.1
 einops==0.6.0
-rir-generator==0.1.4
+rir-generator==0.2.0
 pyroomacoustics==0.8.3
 mir_eval==0.7

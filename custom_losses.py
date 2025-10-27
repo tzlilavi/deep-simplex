@@ -6,6 +6,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 import itertools
 from torchmetrics.functional.audio import scale_invariant_signal_distortion_ratio as si_sdr
+from beamforming import beamformer_torch
+
+from torchmetrics.audio import DeepNoiseSuppressionMeanOpinionScore as DNSMOS
+from scipy.spatial import distance_matrix
+from haaqi_net.src.HAAQI_Net import HAAQI_Net_setup
+import torchaudio
+from speechbrain.inference.speaker import EncoderClassifier
+
 
 class SAD(nn.Module):
     """
@@ -219,6 +227,24 @@ def find_best_permutation_supervised(loss_func, P_output, P_target):
 
     return min_loss, best_P_output, best_permutation, min_SAD_loss, min_RE_loss
 
+def find_best_permutation_supervised_local(mask_output, mask_target):
+    batch_size, F, T, J = mask_output.size()
+    min_loss = float('inf')
+    best_permutation = None
+    permutations = list(itertools.permutations(range(J)))
+
+    for perm in permutations:
+        # Safely permute speaker dimension
+        permuted_output = mask_output[..., list(perm)]
+
+        # Compute loss
+        loss = Functional.mse_loss(permuted_output, mask_target)
+
+        if loss < min_loss:
+            min_loss = loss
+            best_permutation = perm
+    best_M_output = mask_output[:, :, :, best_permutation]
+    return min_loss, best_M_output, best_permutation
 
 def neg_si_sdr(preds, target):
     batch_size = target.shape[0]
@@ -258,38 +284,64 @@ class LocalLoss(nn.Module):
     """
         Local loss for training SpatialNet: combines RTF covariance loss and global CE loss.
     """
-    def __init__(self, F=CFG.lenF0, L=CFG.N_frames, C=(CFG.M-1)*2, J=CFG.Q, RTF_factor=CFG.RTF_factor, global_factor=CFG.global_factor, weight_decay=1e-8):
-            super(LocalLoss, self).__init__()
-            self.name = 'RTF_L2 + global_CE'
-            self.RTF_factor = RTF_factor
-            self.global_factor = global_factor
-            self.weight_decay = weight_decay
+    def __init__(self, F=CFG.lenF0, T=CFG.N_frames, C=(CFG.M-1)*2, J=CFG.Q, RTF_factor=CFG.RTF_factor, Emask=None,
+                 soft_Emask=None, P=None, Xt=None, loss_names=['global', 'globalAVG', 'RTF', 'NN'], low_energy_mask=None,
+                 global_factor=CFG.global_factor, globalAVG_factor=CFG.globalAVG_factor, weight_decay=1e-8,
+                 epochs=CFG.epochs_local):
 
+            super(LocalLoss, self).__init__()
+            # self.RTF_factor = RTF_factor
+            # self.global_factor = global_factor
+            # self.globalAVG_factor = globalAVG_factor
+            # self.weight_decay = weight_decay
+            self.Emask = Emask
+            self.soft_Emask = soft_Emask
             self.losses = []
             self.RTF_losses = []
             self.global_losses = []
-            self.F, self.L, self.C, self.J = F, L, C, J
+            self.F, self.T, self.C, self.J = F, T, C, J
+            self.NFFT = CFG.NFFT
+            self.olap = CFG.olap
+            self.epochs = epochs
+            self.Xt = Xt
+            self.P_original = P
+            self.P_mask, self.fh_p = self.find_Pmask(low_energy_mask)
+            self.y_P, self.Y_P = beamformer_torch(Xt.squeeze(), self.P_mask, self.fh_p, calc_istft=True, apply_mask=False)
+            self.low_energy_mask = low_energy_mask
+            # self.haaqinet = HAAQI_Net_setup(device=CFG.device)
+            # self.hl = torch.tensor([[0., 0., 0., 0., 0., 0., 0., 0.]], device=CFG.device)
+            # self.X_Encoder = EncoderClassifier.from_hparams(source="speechbrain/spkrec-xvect-voxceleb",
+            #                                                 savedir="pretrained_models/spkrec-xvect-voxceleb", run_opts={'device':CFG.device})
+            self.loss_names = loss_names
+            self.name = 'loss' + ''.join(f'_{name}' for name in loss_names)
 
-    def forward(self, mask_output, R, P):
-        """
-                Compute combined local loss.
+    def forward(self, mask_output, R, P, expanded_P=None, soft_Emask=None, epoch=None):
+        losses = {}
+        if 'global' in self.loss_names:
+            losses['global'] = self.global_loss(mask_output, expanded_P)
+        if 'globalAVG' in self.loss_names:
+            losses['globalAVG'] = self.globalAVG_loss(mask_output, P)
+        if 'RTF' in self.loss_names:
+            losses['RTF'] = self.RTF_loss(mask_output, R)
+        if 'NN' in self.loss_names:
+            losses['NN'] = self.NN_loss(mask_output, self.Emask[:, :, :, :-1])
+        if 'BF' in self.loss_names:
+            losses['BF'] = self.BF_loss(self.Xt.squeeze(), mask_output.squeeze(), self.Y_P, self.fh_p, self.P_mask, low_energy_mask=self.low_energy_mask)
 
-                Args:
-                    mask_output (torch.Tensor): [B, F, L, J] estimated masks.
-                    R (torch.Tensor): [B, F, L, C] RTF features.
-                    P (torch.Tensor): [B, L, J] global speaker probabilities.
+        if epoch == 0:
+            self.factors = {}
+            for name, val in losses.items():
+                self.factors[name] = 10.0 / val.item()
 
-                Returns:
-                    Tuple[loss, RTF_loss, global_loss]
-        """
-        loss1 = self.RTF_loss(mask_output, R)
-        loss2 = self.global_loss(mask_output, P)
+        loss = sum(self.factors[name] * val for name, val in losses.items())
 
-        loss = self.RTF_factor * loss1 + self.global_factor * loss2
-        self.RTF_losses.append(loss1.item())
-        self.global_losses.append(loss2.item())
-        self.losses.append(loss.item())
-        return loss, loss1, loss2
+        if not CFG.param_search_flag and epoch is not None and epoch % 10 == 0:
+            msg = f"Epoch {epoch + 1}/{self.epochs}, Total Loss: {loss.item():.4f}"
+            for name, val in losses.items():
+                msg += f", {name}: {val.item():.4f}"
+            print(msg)
+        return loss
+
 
     def RTF_loss(self, mask_output, R):
 
@@ -304,13 +356,140 @@ class LocalLoss(nn.Module):
         diag_idx = torch.arange(mask_cov.size(-1), device=mask_cov.device)
         mask_cov[:, :, diag_idx, diag_idx] = 1.0
 
+        # diff_s = mask_cov.mean(dim=(0,1)) - R_cov.mean(dim=(0,1))
+        # loss = torch.linalg.norm(diff_s, ord='fro')/ (self.L * self.L)
+
         diff_s = mask_cov - R_cov
-        loss = torch.linalg.norm(diff_s, ord='fro', dim=(2, 3)).sum() / (self.F * self.L * self.C)
-        return loss
+        L2_loss = torch.linalg.norm(diff_s, ord='fro', dim=(2, 3)).sum()
+
+
+        return L2_loss
 
     def global_loss(self, mask_output, P):
-        loss = -(P * torch.log(mask_output.mean(dim=1) + 1e-10)).sum(dim=(1, 2)).mean() # / (self.F * self.L * self.J)
+
+        # loss = -torch.einsum('bjt,bftj->bfj', P.transpose(1, 2), torch.log(mask_output + 1e-10)).sum()
+        loss = Functional.kl_div(mask_output.log(), P, reduction="batchmean").squeeze().sum(-1)
+        # diff = mask_output - P[:,None,:,:]
+        # loss = torch.linalg.norm(diff) / (self.F)
+
         return loss
+
+    def globalAVG_loss(self, mask_output, P):
+        # loss = -(P * torch.log(mask_output.mean(dim=1) + 1e-10)).sum(dim=(1, 2))
+        loss = Functional.kl_div(mask_output.mean(dim=1).log(), P, reduction="batchmean").squeeze().sum(-1)
+        return loss
+
+    def NN_loss(self, mask_output, mask_input):
+
+        # diff_s = mask_output - mask_input
+        L2_loss = Functional.mse_loss(mask_output, mask_input)
+        # ce = -mask_input.clamp(min=1e-8, max=1.0) * torch.log(mask_output.clamp(min=1e-8, max=1.0))
+
+        return L2_loss
+
+    def find_Pmask(self, low_energy_mask=None, Np=10):
+
+        Pmask = (self.J) * torch.ones((self.F , self.T), device=CFG.device)
+        fq = []
+        for j in range(self.J):
+            _, top_indices = torch.topk(self.P_original[:, j], k=Np)
+            fq.append(top_indices.detach().cpu())
+            Pmask[:, fq[j]] = j
+        Pmask[low_energy_mask, :] = 0
+        return Pmask, fq
+
+    def BF_loss(self, Xt, mask_output, Y_P, f_p, P_mask, low_energy_mask=None):
+        M_mask = mask_output.argmax(-1)
+        M_mask[low_energy_mask,:] = CFG.Q
+        ym, Y_M = beamformer_torch(Xt, M_mask, f_p, calc_istft=True)
+
+        # loss = Functional.mse_loss(Y_M.real, Y_P.real) + Functional.mse_loss(Y_M.imag, Y_P.imag)
+        loss = -si_sdr(ym, self.y_P).mean()
+        return loss
+
+    def HAAQI_Net_loss(self, stft, mask_output, epoch=None):
+        enhanced_stft = stft[0, :, :, :, None] * mask_output[0, :, :, None, :]
+        n_fft = self.NFFT
+        win_length = self.NFFT
+        olap = self.olap
+        hop_length = int(n_fft - olap * win_length)
+        window = torch.hann_window(win_length, device=stft.device)
+
+        enhanced_waveform = torch.istft(input=enhanced_stft[:, :, 0, :].permute(2, 0, 1), n_fft=n_fft,
+                                        hop_length=hop_length,
+                                        win_length=win_length, window=window, center=True, return_complex=False, ).float().T
+        haaqinet_sum = 0
+        target = torch.ones(1, device=CFG.device) * 0.7
+
+        for audio in enhanced_waveform.T:
+            haaqinet_sum += self.haaqinet(audio.unsqueeze(0), self.hl)[1][0]
+
+        noisy_haqinet_sum = 0
+
+        if epoch==0 or epoch==150:
+            noisy_enhanced_waveform = add_noise(enhanced_waveform, snr_db=5)
+            for audio in noisy_enhanced_waveform.T:
+                noisy_haqinet_sum += self.haaqinet(audio.unsqueeze(0), self.hl)[1][0]
+
+        loss = Functional.mse_loss(haaqinet_sum / self.J, target)
+
+        return loss, haaqinet_sum / self.J, noisy_haqinet_sum / self.J
+
+    def X_vectors_loss(self, stft, mask_output, J=CFG.Q, epoch=None):
+        enhanced_stft = stft[0, :, :, :, None] * mask_output[0, :, :, None, :]
+        n_fft = self.NFFT
+        win_length = self.NFFT
+        olap = self.olap
+        hop_length = int(n_fft - olap * win_length)
+        window = torch.hann_window(win_length, device=stft.device)
+
+        enhanced_waveform = torch.istft(input=enhanced_stft[:, :, 0, :].permute(2, 0, 1), n_fft=n_fft,
+                                        hop_length=hop_length,
+                                        win_length=win_length, window=window, center=True, return_complex=False, ).float().T
+
+        X_vectors = []
+        for audio in enhanced_waveform.T:
+            X_vectors.append(self.X_Encoder.encode_batch(audio).squeeze(0,1))
+        X = torch.stack(X_vectors)
+
+        pairs = list(itertools.combinations(range(J), 2))
+        vec_i = []
+        vec_j = []
+        for i, j in pairs:
+            vec_i.append(X[i])
+            vec_j.append(X[j])
+        vec_i = torch.stack(vec_i)
+        vec_j = torch.stack(vec_j)
+
+        # pairwise_L2 = ((vec_i - vec_j) ** 2)
+        #
+        # loss = torch.exp(-pairwise_L2).mean()
+        margin = 0.2
+        cos_sim = Functional.cosine_similarity(vec_i, vec_j, dim=1)  # ∈ [-1, 1]
+        loss = torch.clamp(cos_sim - margin, min=0).mean()
+
+        return loss
+
+    def similarity_loss(self, mask_output, R, sigma = 1.0):
+        B, F, T, C = R.shape
+        R_norm = (R ** 2).sum(dim=-1, keepdims=True)
+        R_dists = R_norm + R_norm.transpose(-2, -1) - 2 * torch.matmul(R, R.transpose(-2, -1))
+
+        M_norm = (mask_output ** 2).sum(dim=-1, keepdims=True)
+        M_dists = M_norm + M_norm.transpose(-2, -1) - 2 * torch.matmul(mask_output, mask_output.transpose(-2, -1))
+
+        loss = Functional.mse_loss(torch.exp(-R_dists / (sigma ** 2 + 1e-10)), torch.exp(-M_dists / (sigma ** 2 + 1e-10)))
+        return loss
+
+    def smoothness_loss(self, mask_output):
+        grad = mask_output[:, :, :, 1:] - mask_output[:, :, :, :-1]
+
+        return torch.abs(grad).mean()
+
+    def confidence_loss(self, mask_output):
+        probs = mask_output / (mask_output.sum(dim=-1, keepdim=True) + 1e-8)
+        entropy = - (probs * torch.log(probs + 1e-8)).sum(dim=-1)
+        return entropy.mean()
 
     def plot_loss(self):
         """Plot the progression of total loss, RTF loss, and global loss."""
@@ -327,3 +506,384 @@ class LocalLoss(nn.Module):
         plt.show()
 
 
+
+
+
+class CombinedLoss(nn.Module):
+    def __init__(self, F=CFG.lenF0, T=CFG.N_frames, C=(CFG.M-1)*2, J=CFG.Q, RTF_factor=CFG.RTF_factor, Emask=None, soft_Emask=None,
+                 global_factor=CFG.global_factor, globalAVG_factor=CFG.globalAVG_factor, weight_decay=1e-8, epochs=CFG.epochs_local,
+                 first_non0=0, SAD_factor=CFG.SAD_factor, L2_factor=CFG.L2_factor, P_method=CFG.P_method, P_global_final=None,
+                 input_mask=None, noise_col=CFG.noise_col, noise_col_weight=CFG.noise_col_weight, ):
+            super(CombinedLoss, self).__init__()
+            self.name = 'RTF_L2 + global_CE'
+            # self.RTF_factor = RTF_factor
+            # self.global_factor = global_factor
+            # self.globalAVG_factor = globalAVG_factor
+            # self.weight_decay = weight_decay
+            self.SAD_factor = SAD_factor
+            self.L2_factor = L2_factor
+            self.L2_loss = nn.MSELoss(reduction='mean')
+            self.SAD_loss = SAD()
+            self.P_method = P_method
+            self.first_non0 = first_non0
+            self.Emask = Emask
+            self.soft_Emask = soft_Emask
+            self.losses = []
+            self.RTF_losses = []
+            self.global_losses = []
+            self.F, self.T, self.C, self.J = F, T, C, J
+            self.epochs = epochs
+            self.P_global_final = P_global_final
+
+
+    def forward(self, mask_output, R, W_target, P_output=None, epoch=None):
+
+        if self.P_global_final:
+            P_output = self.P_global_final
+
+        PPt_output = torch.bmm(P_output, P_output.transpose(1, 2))
+        PPt_output[:, range(self.first_non0, CFG.N_frames), range(self.first_non0, CFG.N_frames)] = 1
+
+        loss_SAD = self.SAD_loss(PPt_output[:, self.first_non0:CFG.N_frames, self.first_non0:CFG.N_frames],
+                              W_target[:, self.first_non0:CFG.N_frames, self.first_non0:CFG.N_frames])
+
+        loss_L2 = self.L2_loss(PPt_output[:, self.first_non0:CFG.N_frames, self.first_non0:CFG.N_frames],
+                        W_target[:, self.first_non0:CFG.N_frames, self.first_non0:CFG.N_frames])
+
+
+
+        # loss1 = self.RTF_loss(mask_output, R)
+        # loss2 = self.global_loss(mask_output, P_output)
+        # loss3 = self.globalAVG_loss(mask_output, P_output)
+
+        mask_input = self.Emask[:,:,:,:-1]
+        mask_input, soft_mask_input = self.NN(R, P_output)
+        loss4 = self.NN_loss(mask_output, mask_input)
+
+        loss1 = torch.tensor(1.0, device=CFG.device)
+        loss2 = torch.tensor(1.0, device=CFG.device)
+        loss3 = torch.tensor(1.0, device=CFG.device)
+        # loss4 = torch.tensor(1.0, device=CFG.device)
+
+
+        if epoch == 0:
+            self.L2_factor = 10 / loss_L2.item()
+            self.SAD_factor = 10 / loss_SAD.item()
+
+            self.RTF_factor = 10 / loss1.item()
+            self.global_factor = 10 / loss2.item()
+            self.globalAVG_factor = 10 / loss3.item()
+            self.NN_factor = 10 / loss4.item()
+
+
+
+        loss_global = self.SAD_factor * loss_SAD + self.L2_factor * loss_L2
+        # loss_local = (self.RTF_factor * loss1 + self.global_factor * loss2 + self.globalAVG_factor * loss3 +
+        #               self.NN_factor * loss4)
+        loss_local = self.NN_factor * loss4
+
+        loss = loss_local + loss_global
+
+
+        self.losses.append(loss.item())
+
+
+        if not CFG.param_search_flag:
+            if epoch % 10 == 0:
+                print(f"Epoch {epoch + 1}/{self.epochs}, Loss: {loss.item()},"
+                      f" loss_global: {loss_global.item()},"
+                      f" loss_local: {loss_local.item()},")
+
+        return loss, loss_global, loss_local
+
+    def RTF_loss(self, mask_output, R):
+
+        mask_clone = mask_output.clone()
+        if CFG.local_noise_col:
+            mask_clone[:, :, :, -1] = 0
+
+        mask_cov = torch.einsum('bflj,bfji->bfli', mask_clone, mask_clone.transpose(2, 3))
+        R_cov = torch.einsum('bflh,bfhi->bfli', R, R.transpose(2, 3))
+
+        # Enforce diag(M Mᵀ) = 1
+        diag_idx = torch.arange(mask_cov.size(-1), device=mask_cov.device)
+        mask_cov[:, :, diag_idx, diag_idx] = 1.0
+
+        # diff_s = mask_cov.mean(dim=(0,1)) - R_cov.mean(dim=(0,1))
+        # loss = torch.linalg.norm(diff_s, ord='fro')/ (self.L * self.L)
+
+        diff_s = mask_cov - R_cov
+        L2_loss = torch.linalg.norm(diff_s, ord='fro', dim=(2, 3)).sum()
+
+
+        return L2_loss
+
+    def global_loss(self, mask_output, P):
+
+        loss = -torch.einsum('bjt,bftj->bfj', P.transpose(1, 2), torch.log(mask_output + 1e-10)).sum()
+        # diff = mask_output - P[:,None,:,:]
+        # loss = torch.linalg.norm(diff) / (self.F)
+
+        return loss
+
+    def globalAVG_loss(self, mask_output, P):
+        loss = -(P * torch.log(mask_output.mean(dim=1) + 1e-10)).sum(dim=(1, 2))
+        return loss
+
+    def NN(self, R, P):
+        P = P.squeeze(0)
+        R = R.squeeze(0)
+        dist = torch.cdist(R, R, p=2)
+        affinity = torch.exp(-dist)
+        speaker_weight = P.sum(dim=0, keepdim=True) + 1e-12
+        decide = torch.matmul(affinity, P) / speaker_weight
+        training_Emask = torch.argmax(decide, dim=-1)
+
+        Emask_onehot = torch.zeros((1, self.F, self.T, self.J), device=CFG.device)
+        Emask_onehot[0, np.arange(self.F)[:, None], np.arange(self.T), training_Emask.long()] = 1
+        soft_training_Emask = None
+        # soft_training_Emask = Functional.softmax(decide/0.01, dim=-1)
+
+        return Emask_onehot, soft_training_Emask
+
+    def NN_loss(self, mask_output, mask_input):
+
+        # diff_s = mask_output - mask_input
+        L2_loss = Functional.mse_loss(mask_output, mask_input)
+        # ce = -mask_input.clamp(min=1e-8, max=1.0) * torch.log(mask_output.clamp(min=1e-8, max=1.0))
+
+        return L2_loss
+
+
+
+    def similarity_loss(self, mask_output, R, sigma = 1.0):
+        B, F, T, C = R.shape
+        R_norm = (R ** 2).sum(dim=-1, keepdims=True)
+        R_dists = R_norm + R_norm.transpose(-2, -1) - 2 * torch.matmul(R, R.transpose(-2, -1))
+
+        M_norm = (mask_output ** 2).sum(dim=-1, keepdims=True)
+        M_dists = M_norm + M_norm.transpose(-2, -1) - 2 * torch.matmul(mask_output, mask_output.transpose(-2, -1))
+
+        loss = Functional.mse_loss(torch.exp(-R_dists / (sigma ** 2 + 1e-10)), torch.exp(-M_dists / (sigma ** 2 + 1e-10)))
+        return loss
+
+    def smoothness_loss(self, mask_output):
+        grad = mask_output[:, :, :, 1:] - mask_output[:, :, :, :-1]
+
+        return torch.abs(grad).mean()
+
+    def confidence_loss(self, mask_output):
+        probs = mask_output / (mask_output.sum(dim=-1, keepdim=True) + 1e-8)
+        entropy = - (probs * torch.log(probs + 1e-8)).sum(dim=-1)
+        return entropy.mean()
+
+    def plot_loss(self):
+        """Plot the progression of total loss, RTF loss, and global loss."""
+        plt.figure(figsize=(8, 5))
+        plt.plot(self.losses, label="Total Loss", linestyle="-")
+        plt.plot(np.array(self.RTF_losses) * self.RTF_factor, label=f"RTF Loss * {self.RTF_factor}", linestyle="--")
+        plt.plot(np.array(self.global_losses) * self.global_factor, label=f"Global Loss * {self.global_factor}", linestyle=":")
+
+        plt.xlabel("Iterations")
+        plt.ylabel("Loss Value")
+        plt.title("Loss Progression")
+        plt.legend()
+        plt.grid(True)
+        plt.show()
+
+
+
+
+class GNNLoss(nn.Module):
+    def __init__(self, F=CFG.lenF0, T=CFG.N_frames, C=(CFG.M - 1) * 2, J=CFG.Q, Emask=None,
+                 soft_Emask=None, global_factor=CFG.global_factor, globalAVG_factor=CFG.globalAVG_factor, weight_decay=1e-8,
+                 epochs=CFG.epochs_gnn, first_non0=0,  P_method=CFG.P_method, loss_names=['global', 'globalAVG', 'RTF', 'NN']):
+        super(GNNLoss, self).__init__()
+
+        # self.global_factor = global_factor
+        # self.globalAVG_factor = globalAVG_factor
+        self.L2_loss = nn.MSELoss(reduction='mean')
+        self.P_method = P_method
+        self.first_non0 = first_non0
+        self.Emask = Emask
+
+        self.losses = []
+        self.F, self.T, self.C, self.J = F, T, C, J
+        self.epochs = epochs
+
+        self.loss_names = loss_names
+        self.name = 'loss' + ''.join(f'_{name}' for name in loss_names)
+
+
+    def forward(self, mask_output, P, R, soft_Emask=None, epoch=None):
+
+        losses = {}
+        if 'global' in self.loss_names:
+            losses['global'] = self.global_loss(mask_output, P)
+        if 'globalAVG' in self.loss_names:
+            losses['globalAVG'] = self.globalAVG_loss(mask_output, P)
+        if 'NN' in self.loss_names:
+            losses['NN'] = self.NN_loss(mask_output, self.Emask[:,:,:,:-1])
+        if 'RTF' in self.loss_names:
+            losses['RTF'] = self.RTF_loss(mask_output, R)
+        if 'pseudo' in self.loss_names:
+            losses['pseudo'] = self.NN_loss(mask_output, soft_Emask)
+
+        if epoch == 0:
+            self.factors = {}
+            for name, val in losses.items():
+                self.factors[name] = 10.0 / val.item()
+
+        loss = sum(self.factors[name] * val for name, val in losses.items())
+
+        if not CFG.param_search_flag and epoch is not None and epoch % 10 == 0:
+            msg = f"Epoch {epoch + 1}/{self.epochs}, Total Loss: {loss.item():.4f}"
+            for name, val in losses.items():
+                msg += f", {name}: {val.item():.4f})"
+            print(msg)
+        return loss
+
+    def global_loss(self, mask_output, P):
+        loss = -torch.einsum('bjt,bftj->bfj', P.transpose(1, 2), torch.log(mask_output + 1e-10)).sum()
+        # diff = mask_output - P[:,None,:,:]
+        # loss = torch.linalg.norm(diff) / (self.F)
+
+        return loss
+
+    def globalAVG_loss(self, mask_output, P):
+        loss = -(P * torch.log(mask_output.mean(dim=1) + 1e-10)).sum(dim=(1, 2))
+        return loss
+
+    def NN_loss(self, mask_output, mask_input):
+
+        # diff_s = mask_output - mask_input
+        L2_loss = Functional.mse_loss(mask_output, mask_input)
+        # ce = -mask_input.clamp(min=1e-8, max=1.0) * torch.log(mask_output.clamp(min=1e-8, max=1.0))
+
+        return L2_loss
+
+    def RTF_loss(self, mask_output, R):
+
+        mask_clone = mask_output.clone()
+        if CFG.local_noise_col:
+            mask_clone[:, :, :, -1] = 0
+
+        mask_cov = torch.einsum('bflj,bfji->bfli', mask_clone, mask_clone.transpose(2, 3))
+        R_cov = torch.einsum('bflh,bfhi->bfli', R, R.transpose(2, 3))
+
+        # Enforce diag(M Mᵀ) = 1
+        diag_idx = torch.arange(mask_cov.size(-1), device=mask_cov.device)
+        mask_cov[:, :, diag_idx, diag_idx] = 1.0
+
+        # diff_s = mask_cov.mean(dim=(0,1)) - R_cov.mean(dim=(0,1))
+        # loss = torch.linalg.norm(diff_s, ord='fro')/ (self.T * self.T)
+
+        diff_s = mask_cov - R_cov
+        L2_loss = torch.linalg.norm(diff_s, ord='fro', dim=(2, 3)).sum()
+
+
+        return L2_loss
+
+
+class GNNLoss_cleaner(nn.Module):
+    def __init__(self, F=CFG.lenF0, T=CFG.N_frames, C=(CFG.M - 1) * 2, J=CFG.Q, Emask=None,
+                 soft_Emask=None, global_factor=CFG.global_factor, globalAVG_factor=CFG.globalAVG_factor, weight_decay=1e-8,
+                 epochs=CFG.epochs_gnn, first_non0=0,  P_method=CFG.P_method, loss_names=['global', 'globalAVG', 'RTF', 'NN']):
+        super(GNNLoss_cleaner, self).__init__()
+
+        # self.global_factor = global_factor
+        # self.globalAVG_factor = globalAVG_factor
+        self.L2_loss = nn.MSELoss(reduction='mean')
+        self.P_method = P_method
+        self.first_non0 = first_non0
+        self.Emask = Emask
+
+        self.losses = []
+        self.F, self.T, self.C, self.J = F, T, C, J
+        self.epochs = epochs
+
+        self.loss_names = loss_names
+        self.name = 'loss' + ''.join(f'_{name}' for name in loss_names)
+
+
+    def forward(self, mask_output, P, R, soft_Emask=None, epoch=None):
+
+        losses = {}
+        if 'global' in self.loss_names:
+            losses['global'] = self.global_loss(mask_output, P)
+        if 'globalAVG' in self.loss_names:
+            losses['globalAVG'] = self.globalAVG_loss(mask_output, P)
+        if 'NN' in self.loss_names:
+            losses['NN'] = self.NN_loss(mask_output, self.Emask[:,:,:,:-1])
+        if 'RTF' in self.loss_names:
+            losses['RTF'] = self.RTF_loss(mask_output, R)
+
+        # if epoch == 0:
+        #     self.factors = {}
+        #     for name, val in losses.items():
+        #         self.factors[name] = (10.0 / (val.detach() + 1e-10))
+        loss = 0
+        for name, val in losses.items():
+            loss += val# * self.factors[name]
+
+
+        # if not CFG.param_search_flag and epoch is not None and epoch % 10 == 0:
+        #     msg = f"Epoch {epoch + 1}/{self.epochs}, Total Loss: {loss.sum().item():.4f}"
+        #     for name, val in losses.items():
+        #         msg += f", {name}: {val.sum().item():.4f})"
+        #     print(msg)
+        return loss
+
+    def global_loss(self, mask_output, P):
+        # loss = -(P * torch.log(mask_output + 1e-10)).sum(-1)
+        # loss = Functional.mse_loss(mask_output, P, reduction='none').sum(-1)
+        loss = Functional.kl_div(mask_output.log(), P.unsqueeze(1).expand(-1, mask_output.shape[1], -1, -1), reduction="none")
+        return loss.sum(-1)
+
+    def globalAVG_loss(self, mask_output, P):
+        loss = Functional.kl_div(mask_output.mean(dim=1).log(), P, reduction="none").unsqueeze(1).expand(-1, mask_output.shape[1], -1, -1)
+        return loss.sum(-1)
+
+    def RTF_loss(self, mask_output, R):
+
+        mask_clone = mask_output.clone()
+        if CFG.local_noise_col:
+            mask_clone[:, :, :, -1] = 0
+
+        mask_cov = torch.einsum('bflj,bfji->bfli', mask_clone, mask_clone.transpose(2, 3))
+        R_cov = torch.einsum('bflh,bfhi->bfli', R, R.transpose(2, 3))
+
+        # Enforce diag(M Mᵀ) = 1
+        diag_idx = torch.arange(mask_cov.size(-1), device=mask_cov.device)
+        mask_cov[:, :, diag_idx, diag_idx] = 1.0
+
+
+        loss = Functional.mse_loss(mask_cov, R_cov, reduction="none")
+
+        return loss.sum(-1)
+
+    def NN_loss(self, mask_output, mask_input):
+
+        L2_loss = Functional.mse_loss(mask_output, mask_input, reduction='none').sum(-1)
+
+        return L2_loss
+
+
+        return L2_loss
+def add_noise(signal: torch.Tensor, snr_db: float) -> torch.Tensor:
+    """
+    Adds white Gaussian noise to a signal at a specific SNR.
+
+    Args:
+        signal (torch.Tensor): Input signal, shape (..., T)
+        snr_db (float): Desired signal-to-noise ratio in decibels
+
+    Returns:
+        torch.Tensor: Noisy signal
+    """
+    signal = signal.float()
+    rms_signal = torch.sqrt(torch.mean(signal ** 2))
+    snr_linear = 10 ** (snr_db / 10)
+    rms_noise = rms_signal / torch.sqrt(torch.tensor(snr_linear, dtype=signal.dtype, device=signal.device))
+    noise = torch.randn_like(signal) * rms_noise
+    return signal + noise
